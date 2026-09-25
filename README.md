@@ -6,24 +6,32 @@ only — nothing syncs back from SP into Obsidian.
 
 ## What it does
 
-- `next` becomes the task title. Accepts a string, list, number, or boolean.
-- `waiting_on` (string or list) prefixes the title ("Waiting on Alex: ...", or "Alex and Sam" /
-  "Alex, Sam and Jo" for a deduped list) and adds the configured reminder tag — untagged if that
-  tag doesn't exist yet in SP.
+- `next` (frontmatter key name configurable) becomes the task title. Accepts a string, list,
+  number, or boolean.
+- `waiting_on` (frontmatter key name configurable; string or list) prefixes the title ("Waiting on
+  Alex: ...", or "Alex and Sam" / "Alex, Sam and Jo" for a deduped list) and adds the configured
+  reminder tag — untagged if that tag doesn't exist yet in SP.
 - The note's `Project/<name>` tag (frontmatter or inline body, via `getAllTags`), if present,
-  picks the SP project. Only the segment directly under `Project/` is used, so `Project/Website`
-  and `Project/Website/v2` collapse to the same project; two *different* names abort the send
-  rather than guessing. A note with no `Project/` tag at all just creates a projectless task.
+  picks the SP project. The prefix (`Project/` by default) is configurable and can be a
+  comma-separated list of prefixes. Only the segment directly under the matched prefix is used, so
+  `Project/Website` and `Project/Website/v2` collapse to the same project; two *different* names
+  abort the send rather than guessing. A note with no matching tag at all just creates a
+  projectless task.
 - Project and reminder tag both have to already exist in Super Productivity — the API is
-  read-only for both. If a note *has* a `Project/<name>` tag but SP has no matching project, the
-  send aborts (notice) rather than silently dropping it; a missing reminder tag just sends
-  untagged.
-- The task's notes field gets a clickable markdown link back to the note
-  (`[label](obsidian://open?vault=...&file=...)`), since SP only auto-linkifies http/https, not
-  the `obsidian:` scheme.
+  read-only for both. If a note *has* a project tag but SP has no matching project, the send
+  aborts (notice) rather than silently dropping it; a missing reminder tag just sends untagged.
+- If a manual send is triggered on a note with no `next` value, a notice explains there's nothing
+  to send (auto-triggered sends stay silent, since every keystroke touches frontmatter).
+- Optionally (on by default, toggleable), the task's notes field gets a clickable markdown link
+  back to the note (`[label](obsidian://open?vault=...&file=...)`), since SP only auto-linkifies
+  http/https, not the `obsidian:` scheme.
 - The plugin never overwrites notes you typed yourself in SP — only an empty field, a bare
   `obsidian://open?...` (old format), or its own current link format gets replaced.
 - `sp_task_id` and `sp_task_ref` are written back into the note's frontmatter by the plugin.
+  `sp_task_ref` is the note's permanent display number: once assigned it's read from the note
+  itself rather than internal state, so it can't drift or get reassigned if `data.json` is ever
+  lost.
+- A successful send shows a brief confirmation notice.
 
 Runs automatically (debounced, 250ms floor) whenever a note's frontmatter changes or the note is
 renamed, or immediately via the **Send current note to Super Productivity** command — which also

@@ -14,6 +14,10 @@ const DEFAULT_SETTINGS = {
 	titleTemplate: '{next}',
 	waitingTitleTemplate: 'Waiting on {waiting_on}: {next}',
 	showRefInTitle: true,
+	projectTagPrefixes: 'Project/',
+	nextFieldName: 'next',
+	waitingOnFieldName: 'waiting_on',
+	includeDeepLink: true,
 };
 
 const MIN_DEBOUNCE_MS = 250;
@@ -54,6 +58,15 @@ function renderTemplate(template, { next, waitingOn, title, ref }) {
 // terminate a markdown link early.
 function encodeLinkComponent(str) {
 	return encodeURIComponent(str).replace(/\(/g, '%28').replace(/\)/g, '%29');
+}
+
+// "Project/, Area/" -> ["Project/", "Area/"], each guaranteed to end with "/".
+function parsePrefixList(raw) {
+	return String(raw || '')
+		.split(',')
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.map((s) => (s.endsWith('/') ? s : `${s}/`));
 }
 
 function notesAreOurs(notes) {
@@ -248,6 +261,10 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		console.error(`[SP Tasker] ${msg}`);
 	}
 
+	notifySuccess(msg) {
+		new Notice(`SP Tasker: ${msg}`);
+	}
+
 	// -- scheduling ------------------------------------------------------------
 
 	scheduleSend(file) {
@@ -267,12 +284,16 @@ module.exports = class SPTaskerPlugin extends Plugin {
 	resolveProjectNames(file) {
 		const cache = this.app.metadataCache.getFileCache(file);
 		const tags = (cache && getAllTags(cache)) || [];
+		const prefixes = parsePrefixList(this.settings.projectTagPrefixes);
 		const names = new Set();
 		for (const t of tags) {
 			const clean = t.replace(/^#/, '');
-			if (clean.startsWith('Project/')) {
-				const segment = clean.slice('Project/'.length).split('/')[0];
-				if (segment) names.add(segment);
+			for (const prefix of prefixes) {
+				if (clean.startsWith(prefix)) {
+					const segment = clean.slice(prefix.length).split('/')[0];
+					if (segment) names.add(segment);
+					break;
+				}
 			}
 		}
 		return [...names];
@@ -306,8 +327,11 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		if (!(file instanceof TFile) || file.extension !== 'md') return;
 
 		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-		const nextText = toText(fm && fm.next);
-		if (!nextText) return; // required; nothing to send
+		const nextText = toText(fm && fm[this.settings.nextFieldName]);
+		if (!nextText) {
+			if (manual) this.notify(`"${file.basename}" has no "${this.settings.nextFieldName}" value; nothing to send.`);
+			return;
+		}
 
 		if (!this.settings.apiToken) {
 			this.notify('no API access token set. Configure it in plugin settings.');
@@ -335,7 +359,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		}
 		const projectName = project ? project.title || project.name : '';
 
-		const waitingRaw = fm.waiting_on;
+		const waitingRaw = fm[this.settings.waitingOnFieldName];
 		const waitingList = waitingRaw == null ? [] : Array.isArray(waitingRaw) ? waitingRaw : [waitingRaw];
 		const waitingOn = joinGrammatical(waitingList);
 
@@ -360,7 +384,12 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		const existingRef = fm.sp_task_ref;
 		const record = existingTaskId ? this.sent[existingTaskId] : null;
 
-		const plannedRef = record && typeof existingRef === 'number' ? existingRef : this.refCounter;
+		// The note's own sp_task_ref, once written, is that note's permanent
+		// display number - trust it even if the sent-record cache (data.json)
+		// was lost, so a missing record can't reassign a new/higher number and
+		// then flap between the two on every subsequent edit. Only fall back
+		// to the live counter for a note that has never been assigned one.
+		const plannedRef = typeof existingRef === 'number' ? existingRef : this.refCounter;
 		let title = this.buildTitle(nextText, waitingOn, file, plannedRef);
 		let contentSig = [title, projectName, tagName].join(SEP);
 		let fullSig = contentSig + SEP + file.path;
@@ -368,18 +397,21 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		try {
 			if (!manual && record && record.full === fullSig) return;
 
+			const link = this.settings.includeDeepLink ? this.buildDeepLink(file) : null;
+
 			if (record && record.content === contentSig && record.full !== fullSig) {
 				// Path-only change (rename/move). Refresh the link, nothing else -
 				// this must never reopen/resurrect a completed task.
-				const link = this.buildDeepLink(file);
-				let current = null;
-				try {
-					current = await this.client.getTask(existingTaskId);
-				} catch (e) {
-					// best effort; fall through and still try the notes update
-				}
-				if (!current || notesAreOurs(current.notes)) {
-					await this.client.updateTask(existingTaskId, { notes: link });
+				if (link) {
+					let current = null;
+					try {
+						current = await this.client.getTask(existingTaskId);
+					} catch (e) {
+						// best effort; fall through and still try the notes update
+					}
+					if (!current || notesAreOurs(current.notes)) {
+						await this.client.updateTask(existingTaskId, { notes: link });
+					}
 				}
 				record.full = fullSig;
 				record.path = file.path;
@@ -387,7 +419,6 @@ module.exports = class SPTaskerPlugin extends Plugin {
 				return;
 			}
 
-			const link = this.buildDeepLink(file);
 			let current = null;
 			if (existingTaskId) {
 				current = await this.client.getTask(existingTaskId);
@@ -396,27 +427,27 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			if (current && !current.isDone) {
 				const payload = { title, tagIds };
 				if (project) payload.projectId = project.id;
-				if (notesAreOurs(current.notes)) payload.notes = link;
+				if (link && notesAreOurs(current.notes)) payload.notes = link;
 				await this.client.updateTask(existingTaskId, payload);
 				this.sent[existingTaskId] = { content: contentSig, full: fullSig, path: file.path };
 				await this.persist();
+				if (!manual) this.notifySuccess(`updated "${title}".`);
 				return; // keeps its ref
 			}
 
-			// done / archived / 404 / brand new -> create a fresh task
-			const newRef = this.refCounter;
-			if (newRef !== plannedRef) {
-				title = this.buildTitle(nextText, waitingOn, file, newRef);
-				contentSig = [title, projectName, tagName].join(SEP);
-				fullSig = contentSig + SEP + file.path;
-			}
-			const createPayload = { title, tagIds, notes: link };
+			// done / archived / 404 / brand new -> create a fresh task, reusing
+			// the note's existing ref (if it has one) so its display number
+			// stays stable across task recreation.
+			const newRef = plannedRef;
+			const createPayload = { title, tagIds };
+			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
 			const created = await this.client.createTask(createPayload);
-			this.refCounter = newRef + 1;
+			if (typeof existingRef !== 'number') this.refCounter = newRef + 1;
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
 			await this.writeFrontmatter(file, { sp_task_id: created.id, sp_task_ref: newRef });
 			await this.persist();
+			if (!manual) this.notifySuccess(`created "${title}".`);
 		} catch (e) {
 			this.notify(e.message);
 		}
@@ -530,6 +561,44 @@ class SPTaskerSettingTab extends PluginSettingTab {
 				type: 'group',
 				heading: 'Note properties',
 				items: [
+					{
+						name: '"Next" field name',
+						desc: 'Frontmatter key read as the task title source.',
+						control: {
+							type: 'text',
+							key: 'nextFieldName',
+							placeholder: DEFAULT_SETTINGS.nextFieldName,
+							defaultValue: DEFAULT_SETTINGS.nextFieldName,
+							validate: requiredText('"Next" field name'),
+						},
+					},
+					{
+						name: '"Waiting on" field name',
+						desc: 'Frontmatter key read for the waiting-on list.',
+						control: {
+							type: 'text',
+							key: 'waitingOnFieldName',
+							placeholder: DEFAULT_SETTINGS.waitingOnFieldName,
+							defaultValue: DEFAULT_SETTINGS.waitingOnFieldName,
+							validate: requiredText('"Waiting on" field name'),
+						},
+					},
+					{
+						name: 'Project tag prefixes',
+						desc: 'Comma-separated tag prefixes that mark a project, e.g. "Project/, Area/". Only the segment right after the prefix is used.',
+						control: {
+							type: 'text',
+							key: 'projectTagPrefixes',
+							placeholder: DEFAULT_SETTINGS.projectTagPrefixes,
+							defaultValue: DEFAULT_SETTINGS.projectTagPrefixes,
+							validate: requiredText('Project tag prefixes'),
+						},
+					},
+					{
+						name: 'Include note link',
+						desc: "Add a link back to the note in the task's notes field.",
+						control: { type: 'toggle', key: 'includeDeepLink', defaultValue: DEFAULT_SETTINGS.includeDeepLink },
+					},
 					{
 						name: 'Reminder tag name',
 						desc: 'Existing SP tag applied to tasks created from a note with a waiting_on field. Missing tag just sends the task untagged.',
