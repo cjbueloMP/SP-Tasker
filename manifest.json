@@ -1,0 +1,9 @@
+{
+  "id": "sp-tasker",
+  "name": "SP Tasker",
+  "version": "1.0.0",
+  "minAppVersion": "1.13.7",
+  "description": "One-way sync: editing a note's frontmatter creates or updates a matching task in Super Productivity via its local REST API.",
+  "author": "Collin Buelo",
+  "isDesktopOnly": true
+}
