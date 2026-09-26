@@ -1,9 +1,8 @@
 'use strict';
 
-const { Plugin, PluginSettingTab, ButtonComponent, Notice, TFile, requestUrl, getAllTags } = require('obsidian');
+const { Plugin, PluginSettingTab, Notice, TFile, requestUrl, getAllTags } = require('obsidian');
 
 const SEP = String.fromCharCode(1); // avoids a literal control byte in the source
-const LEGACY_SEP = String.fromCharCode(0); // 0.1.0's separator, for reading old data.json only
 
 const DEFAULT_SETTINGS = {
 	apiBaseUrl: 'http://127.0.0.1:3876',
@@ -75,23 +74,12 @@ function notesAreOurs(notes) {
 	return /^\[[^\]]*\]\(obsidian:\/\/open\?[^)]*\)$/.test(notes);
 }
 
-// Reads both the current {content, full, path} record shape and 0.1.0's
-// bare-string / \x00-separated records.
 function readSent(raw) {
 	const out = {};
 	if (!raw || typeof raw !== 'object') return out;
 	for (const [taskId, val] of Object.entries(raw)) {
 		if (val && typeof val === 'object' && typeof val.full === 'string') {
 			out[taskId] = { content: val.content || '', full: val.full, path: val.path || '' };
-			continue;
-		}
-		if (typeof val === 'string') {
-			if (val.includes(LEGACY_SEP)) {
-				const [content, path] = val.split(LEGACY_SEP);
-				out[taskId] = { content: content || '', full: val.split(LEGACY_SEP).join(SEP), path: path || '' };
-			} else {
-				out[taskId] = { content: '', full: val, path: '' };
-			}
 		}
 	}
 	return out;
@@ -263,6 +251,15 @@ module.exports = class SPTaskerPlugin extends Plugin {
 
 	notifySuccess(msg) {
 		new Notice(`SP Tasker: ${msg}`);
+	}
+
+	// Forces every note to re-verify against SP on its next send instead of
+	// trusting cached signatures - safe because sendFile always re-checks the
+	// live task by the note's own sp_task_id before deciding create vs.
+	// update, so a cleared cache can't cause a duplicate task.
+	async clearSent() {
+		this.sent = {};
+		await this.persist();
 	}
 
 	// -- scheduling ------------------------------------------------------------
@@ -521,14 +518,16 @@ class SPTaskerSettingTab extends PluginSettingTab {
 					{
 						name: 'Test connection',
 						desc: 'Checks that Super Productivity is reachable and the token is valid.',
-						action: (el) => {
-							new ButtonComponent(el).setButtonText('Test').onClick(async () => {
-								try {
-									await this.plugin.client.health();
-									new Notice('SP Tasker: connected to Super Productivity.');
-								} catch (e) {
-									new Notice(`SP Tasker: ${e.message}`);
-								}
+						render: (setting) => {
+							setting.addButton((btn) => {
+								btn.setButtonText('Test').onClick(async () => {
+									try {
+										await this.plugin.client.health();
+										new Notice('SP Tasker: connected to Super Productivity.');
+									} catch (e) {
+										new Notice(`SP Tasker: ${e.message}`);
+									}
+								});
 							});
 						},
 					},
@@ -636,6 +635,24 @@ class SPTaskerSettingTab extends PluginSettingTab {
 						name: 'Show number in title',
 						desc: "If the title template doesn't reference {ref}, prefix the rendered title with #<ref>.",
 						control: { type: 'toggle', key: 'showRefInTitle', defaultValue: DEFAULT_SETTINGS.showRefInTitle },
+					},
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Maintenance',
+				items: [
+					{
+						name: 'Clear sync cache',
+						desc: 'Forgets which notes were already sent, so the next edit to each one re-verifies it against Super Productivity from scratch. Use this if data.json ever gets out of sync (e.g. notes edited while Obsidian was closed). Does not touch settings, task numbers, or existing SP tasks.',
+						render: (setting) => {
+							setting.addButton((btn) => {
+								btn.setButtonText('Clear').onClick(async () => {
+									await this.plugin.clearSent();
+									new Notice('SP Tasker: sync cache cleared.');
+								});
+							});
+						},
 					},
 				],
 			},
