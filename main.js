@@ -3,7 +3,6 @@
 const { Plugin, PluginSettingTab, ButtonComponent, Notice, TFile, requestUrl, getAllTags } = require('obsidian');
 
 const SEP = String.fromCharCode(1); // avoids a literal control byte in the source
-const LEGACY_SEP = String.fromCharCode(0); // 0.1.0's separator, for reading old data.json only
 
 const DEFAULT_SETTINGS = {
 	apiBaseUrl: 'http://127.0.0.1:3876',
@@ -75,23 +74,12 @@ function notesAreOurs(notes) {
 	return /^\[[^\]]*\]\(obsidian:\/\/open\?[^)]*\)$/.test(notes);
 }
 
-// Reads both the current {content, full, path} record shape and 0.1.0's
-// bare-string / \x00-separated records.
 function readSent(raw) {
 	const out = {};
 	if (!raw || typeof raw !== 'object') return out;
 	for (const [taskId, val] of Object.entries(raw)) {
 		if (val && typeof val === 'object' && typeof val.full === 'string') {
 			out[taskId] = { content: val.content || '', full: val.full, path: val.path || '' };
-			continue;
-		}
-		if (typeof val === 'string') {
-			if (val.includes(LEGACY_SEP)) {
-				const [content, path] = val.split(LEGACY_SEP);
-				out[taskId] = { content: content || '', full: val.split(LEGACY_SEP).join(SEP), path: path || '' };
-			} else {
-				out[taskId] = { content: '', full: val, path: '' };
-			}
 		}
 	}
 	return out;
