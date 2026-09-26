@@ -326,6 +326,24 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		});
 	}
 
+	// processFrontMatter re-reads and re-parses the file fresh each call, so
+	// it can fail with a YAMLParseError on frontmatter that was valid when we
+	// last read the cache - typically because the user is still typing and
+	// briefly left it in an invalid state. That clears itself within a
+	// second or two, so a few short retries clear almost all of these before
+	// resorting to surfacing an error.
+	async writeFrontmatterWithRetry(file, fields, attempts = 4, baseDelayMs = 300) {
+		for (let i = 0; i < attempts; i++) {
+			try {
+				await this.writeFrontmatter(file, fields);
+				return;
+			} catch (e) {
+				if (i === attempts - 1) throw e;
+				await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** i));
+			}
+		}
+	}
+
 	buildTitle(nextText, waitingOn, file, ref) {
 		const template = waitingOn ? this.settings.waitingTitleTemplate : this.settings.titleTemplate;
 		let rendered = renderTemplate(template, { next: nextText, waitingOn, title: file.basename, ref });
@@ -459,13 +477,45 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			// the note's existing ref (if it has one) so its display number
 			// stays stable across task recreation.
 			const newRef = plannedRef;
+			const isNewRef = typeof existingRef !== 'number';
+			if (isNewRef) this.refCounter = newRef + 1; // reserve the number before touching SP
+
+			// sp_task_ref never comes from SP - it's ours alone - so writing it
+			// first means a failure here has touched nothing external. Nothing
+			// was created, so this is just an ordinary failed send: release the
+			// reserved number and bail out, same as any other aborted send.
+			try {
+				await this.writeFrontmatterWithRetry(file, { sp_task_ref: newRef });
+			} catch (e) {
+				if (isNewRef) this.refCounter = newRef;
+				this.notify(`couldn't write to "${file.basename}"'s frontmatter (${e.message}); nothing was sent.`);
+				return;
+			}
+			await this.persist();
+
 			const createPayload = { title, tagIds };
 			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
 			const created = await this.client.createTask(createPayload);
-			if (typeof existingRef !== 'number') this.refCounter = newRef + 1;
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
-			await this.writeFrontmatter(file, { sp_task_id: created.id, sp_task_ref: newRef });
+
+			// The SP task now exists - a failure writing its id back must not
+			// look like an ordinary retryable failure, since retrying would
+			// just call createTask again and leave this one orphaned. The note
+			// already carries the correct ref number and title, so recovery
+			// doesn't need it copied from here: a duplicate is spottable in SP
+			// by two tasks sharing that same "#<ref>" title.
+			try {
+				await this.writeFrontmatterWithRetry(file, { sp_task_id: created.id });
+			} catch (e) {
+				await this.persist();
+				this.notify(
+					`created SP task "${title}" but couldn't record its id in "${file.basename}" (${e.message}). ` +
+						`If the next send creates a duplicate, look in Super Productivity for two tasks titled "#${newRef} ..." and remove the extra one.`
+				);
+				return;
+			}
+
 			await this.persist();
 			this.pendingRetry.delete(file.path);
 			await this.flushPendingRetries(file.path);
