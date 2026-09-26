@@ -116,7 +116,9 @@ class SPClient {
 				throw: false,
 			});
 		} catch (e) {
-			throw new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			const err = new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			err.retryable = true; // connectivity failure, not a rejection by SP itself - worth retrying once SP is back
+			throw err;
 		}
 
 		if (res.status === 401) {
@@ -202,6 +204,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		);
 
 		this._timers = new Map(); // path -> timeout id
+		this.pendingRetry = new Set(); // paths that failed to reach SP; retried opportunistically, in-memory only
 
 		this.addSettingTab(new SPTaskerSettingTab(this.app, this));
 
@@ -260,6 +263,20 @@ module.exports = class SPTaskerPlugin extends Plugin {
 	async clearSent() {
 		this.sent = {};
 		await this.persist();
+	}
+
+	// Called right after any send actually reaches SP successfully - that's
+	// proof SP is back up, so opportunistically retry other notes that
+	// previously failed to connect, instead of polling on a timer. In-memory
+	// only: a note stuck here is forgotten on Obsidian restart and just falls
+	// back to needing a manual edit/send, same as before this existed.
+	async flushPendingRetries(excludePath) {
+		const paths = [...this.pendingRetry].filter((p) => p !== excludePath);
+		for (const path of paths) {
+			this.pendingRetry.delete(path);
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) await this.sendFile(file, { manual: false });
+		}
 	}
 
 	// -- scheduling ------------------------------------------------------------
@@ -346,6 +363,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			try {
 				project = await this.client.findProject(projectNames[0]);
 			} catch (e) {
+				if (e.retryable) this.pendingRetry.add(file.path);
 				this.notify(e.message);
 				return;
 			}
@@ -367,6 +385,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			try {
 				tag = await this.client.findTag(this.settings.reminderTagName);
 			} catch (e) {
+				if (e.retryable) this.pendingRetry.add(file.path);
 				this.notify(e.message);
 			}
 			if (!tag) {
@@ -409,6 +428,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 					if (!current || notesAreOurs(current.notes)) {
 						await this.client.updateTask(existingTaskId, { notes: link });
 					}
+					this.pendingRetry.delete(file.path);
+					await this.flushPendingRetries(file.path);
 				}
 				record.full = fullSig;
 				record.path = file.path;
@@ -428,6 +449,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 				await this.client.updateTask(existingTaskId, payload);
 				this.sent[existingTaskId] = { content: contentSig, full: fullSig, path: file.path };
 				await this.persist();
+				this.pendingRetry.delete(file.path);
+				await this.flushPendingRetries(file.path);
 				if (!manual) this.notifySuccess(`updated "${title}".`);
 				return; // keeps its ref
 			}
@@ -444,8 +467,11 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
 			await this.writeFrontmatter(file, { sp_task_id: created.id, sp_task_ref: newRef });
 			await this.persist();
+			this.pendingRetry.delete(file.path);
+			await this.flushPendingRetries(file.path);
 			if (!manual) this.notifySuccess(`created "${title}".`);
 		} catch (e) {
+			if (e.retryable) this.pendingRetry.add(file.path);
 			this.notify(e.message);
 		}
 	}
