@@ -8,6 +8,8 @@ Obsidian plugin: editing a note's frontmatter creates or updates a matching task
 - `waiting_on` (frontmatter key name configurable; string or list) prefixes the title ("Waiting on Alex: ...", or "Alex and Sam" / "Alex, Sam and Jo" for a deduped list) and adds the configured reminder tag — untagged if that tag doesn't exist yet in SP.
 - The note's `Project/<name>` tag (frontmatter or inline body), if present, picks the SP project. The prefix (`Project/` by default) is configurable and can be a comma-separated list of prefixes. Only the segment directly under the matched prefix is used, so `Project/Website` and `Project/Website/v2` collapse to the same project. Two *different* names abort the send rather than guessing. A note with no matching tag at all just creates a projectless task.
 - Project and reminder tag both have to already exist in Super Productivity — the API is  read-only for both. If a note *has* a project tag but SP has no matching project, the send aborts (notice) rather than silently dropping it; a missing reminder tag just sends untagged.
+- `start` (frontmatter key name configurable; optional, `YYYY-MM-DD`) becomes the task's due date in SP. When a task is *created*, a `start` of today or later is used; a past, missing, or unparseable `start` sends no due date. When an existing task is *updated*, only a `start` strictly in the future is sent, so a task you've pushed to a later day in SP isn't snapped back to today by an unrelated edit or a manual send. A future `start` still overwrites a due date you set by hand in SP (Obsidian-first). A past, today, or removed `start` never changes or clears an existing due date in SP.
+- Newly *created* tasks get no due date unless `start` supplies one. SP would otherwise stamp them as due today whenever its Today view is open; the "No due date on new tasks" setting (on by default) suppresses that. It only affects creation, never updates.
 - If a manual send is triggered on a note with no `next` value, a notice explains there's nothing to send (auto-triggered sends stay silent, since every keystroke touches frontmatter).
 - Optionally (on by default, toggleable), the task's notes field gets a clickable markdown link back to the note (`[label](obsidian://open?vault=...&file=...)`), since SP only auto-linkifies http/https, not the `obsidian:` scheme.
 - The plugin never overwrites notes you typed yourself in SP — only an empty field, a bare `obsidian://open?...` (old format), or its own current link format gets replaced.
@@ -32,7 +34,7 @@ I may consider adding to obsidian office community plugins, but this plugin is s
 
 ## Idempotency
 
-Every send computes two signatures for the note: `content` (title, resolved project name,resolved tag name) and `full` (content + the note's vault path), joined with a `\x01` separator and stored per SP task id.
+Every send computes two signatures for the note: `content` (title, resolved project name, resolved tag name, plus the due date when `start` supplies one) and `full` (content + the note's vault path), joined with a `\x01` separator and stored per SP task id.
 
 - Auto-triggered sends return early when the `full` signature is unchanged. The manual command never short-circuits this way — it always re-checks the task with SP.
 - If only the path changed (content signature still matches), the plugin refreshes the notes link and does nothing else — this is what stops a rename from reopening a completed task.

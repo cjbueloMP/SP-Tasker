@@ -16,7 +16,9 @@ const DEFAULT_SETTINGS = {
 	projectTagPrefixes: 'Project/',
 	nextFieldName: 'next',
 	waitingOnFieldName: 'waiting_on',
+	startFieldName: 'start',
 	includeDeepLink: true,
+	noDueDateOnCreate: true,
 };
 
 const MIN_DEBOUNCE_MS = 250;
@@ -66,6 +68,27 @@ function parsePrefixList(raw) {
 		.map((s) => s.trim())
 		.filter(Boolean)
 		.map((s) => (s.endsWith('/') ? s : `${s}/`));
+}
+
+// A note's start value (YYYY-MM-DD, optionally followed by a time) becomes SP's
+// dueDay only when it is today or later, judged in local time. Past, missing
+// or unparseable values return null, meaning "don't send a due date".
+function startToDueDay(value) {
+	const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(toText(value));
+	if (!m) return null;
+	const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+	const parsed = new Date(y, mo - 1, d);
+	if (parsed.getFullYear() !== y || parsed.getMonth() !== mo - 1 || parsed.getDate() !== d) return null;
+	const now = new Date();
+	if (parsed < new Date(now.getFullYear(), now.getMonth(), now.getDate())) return null;
+	return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+// Local-time YYYY-MM-DD for "today"; sorts correctly against a dueDay string.
+function localTodayStr() {
+	const n = new Date();
+	const pad = (v) => String(v).padStart(2, '0');
+	return `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}`;
 }
 
 function notesAreOurs(notes) {
@@ -377,6 +400,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			}
 		}
 
+		const dueDay = startToDueDay(fm[this.settings.startFieldName]);
+
 		const existingTaskId = fm.sp_task_id;
 		const existingRef = fm.sp_task_ref;
 		const record = existingTaskId ? this.sent[existingTaskId] : null;
@@ -388,7 +413,9 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		// to the live counter for a note that has never been assigned one.
 		const plannedRef = typeof existingRef === 'number' ? existingRef : this.refCounter;
 		let title = this.buildTitle(nextText, waitingOn, file, plannedRef);
-		let contentSig = [title, projectName, tagName].join(SEP);
+		// dueDay joins the signature only when present, so existing records
+		// (which never had one) keep matching and aren't needlessly re-sent.
+		let contentSig = [title, projectName, tagName].join(SEP) + (dueDay ? SEP + dueDay : '');
 		let fullSig = contentSig + SEP + file.path;
 
 		try {
@@ -424,6 +451,10 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			if (current && !current.isDone) {
 				const payload = { title, tagIds };
 				if (project) payload.projectId = project.id;
+				// Updates only push a strictly future start. Today (or past) is left
+				// alone so a task the user pushed to a later day in SP isn't snapped
+				// back to today by an unrelated edit.
+				if (dueDay && dueDay > localTodayStr()) payload.dueDay = dueDay;
 				if (link && notesAreOurs(current.notes)) payload.notes = link;
 				await this.client.updateTask(existingTaskId, payload);
 				this.sent[existingTaskId] = { content: contentSig, full: fullSig, path: file.path };
@@ -439,6 +470,10 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			const createPayload = { title, tagIds };
 			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
+			// SP's TaskService.add() stamps dueDay = today when its Today view is
+			// open, unless the payload carries a dueDay key at all; null opts out.
+			if (dueDay) createPayload.dueDay = dueDay;
+			else if (this.settings.noDueDateOnCreate) createPayload.dueDay = null;
 			const created = await this.client.createTask(createPayload);
 			if (typeof existingRef !== 'number') this.refCounter = newRef + 1;
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
@@ -583,6 +618,17 @@ class SPTaskerSettingTab extends PluginSettingTab {
 						},
 					},
 					{
+						name: '"Start" field name',
+						desc: "Frontmatter key read for a start date (YYYY-MM-DD). If it is today or later it becomes the task's due date in SP; past dates are ignored.",
+						control: {
+							type: 'text',
+							key: 'startFieldName',
+							placeholder: DEFAULT_SETTINGS.startFieldName,
+							defaultValue: DEFAULT_SETTINGS.startFieldName,
+							validate: requiredText('"Start" field name'),
+						},
+					},
+					{
 						name: 'Project tag prefixes',
 						desc: 'Comma-separated tag prefixes that mark a project, e.g. "Project/, Area/". Only the segment right after the prefix is used.',
 						control: {
@@ -597,6 +643,11 @@ class SPTaskerSettingTab extends PluginSettingTab {
 						name: 'Include note link',
 						desc: "Add a link back to the note in the task's notes field.",
 						control: { type: 'toggle', key: 'includeDeepLink', defaultValue: DEFAULT_SETTINGS.includeDeepLink },
+					},
+					{
+						name: 'No due date on new tasks',
+						desc: "Create tasks without a due date, even while SP's Today view is open (SP otherwise schedules them for today). Only affects task creation.",
+						control: { type: 'toggle', key: 'noDueDateOnCreate', defaultValue: DEFAULT_SETTINGS.noDueDateOnCreate },
 					},
 					{
 						name: 'Reminder tag name',
