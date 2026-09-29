@@ -139,7 +139,9 @@ class SPClient {
 				throw: false,
 			});
 		} catch (e) {
-			throw new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			const err = new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			err.retryable = true; // connectivity failure, not a rejection by SP itself - worth retrying once SP is back
+			throw err;
 		}
 
 		if (res.status === 401) {
@@ -225,6 +227,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		);
 
 		this._timers = new Map(); // path -> timeout id
+		this.pendingRetry = new Set(); // paths that failed to reach SP; retried opportunistically, in-memory only
 
 		this.addSettingTab(new SPTaskerSettingTab(this.app, this));
 
@@ -285,6 +288,20 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		await this.persist();
 	}
 
+	// Called right after any send actually reaches SP successfully - that's
+	// proof SP is back up, so opportunistically retry other notes that
+	// previously failed to connect, instead of polling on a timer. In-memory
+	// only: a note stuck here is forgotten on Obsidian restart and just falls
+	// back to needing a manual edit/send, same as before this existed.
+	async flushPendingRetries(excludePath) {
+		const paths = [...this.pendingRetry].filter((p) => p !== excludePath);
+		for (const path of paths) {
+			this.pendingRetry.delete(path);
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) await this.sendFile(file, { manual: false });
+		}
+	}
+
 	// -- scheduling ------------------------------------------------------------
 
 	scheduleSend(file) {
@@ -332,6 +349,24 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		});
 	}
 
+	// processFrontMatter re-reads and re-parses the file fresh each call, so
+	// it can fail with a YAMLParseError on frontmatter that was valid when we
+	// last read the cache - typically because the user is still typing and
+	// briefly left it in an invalid state. That clears itself within a
+	// second or two, so a few short retries clear almost all of these before
+	// resorting to surfacing an error.
+	async writeFrontmatterWithRetry(file, fields, attempts = 4, baseDelayMs = 300) {
+		for (let i = 0; i < attempts; i++) {
+			try {
+				await this.writeFrontmatter(file, fields);
+				return;
+			} catch (e) {
+				if (i === attempts - 1) throw e;
+				await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** i));
+			}
+		}
+	}
+
 	buildTitle(nextText, waitingOn, file, ref) {
 		const template = waitingOn ? this.settings.waitingTitleTemplate : this.settings.titleTemplate;
 		let rendered = renderTemplate(template, { next: nextText, waitingOn, title: file.basename, ref });
@@ -369,6 +404,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			try {
 				project = await this.client.findProject(projectNames[0]);
 			} catch (e) {
+				if (e.retryable) this.pendingRetry.add(file.path);
 				this.notify(e.message);
 				return;
 			}
@@ -390,6 +426,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			try {
 				tag = await this.client.findTag(this.settings.reminderTagName);
 			} catch (e) {
+				if (e.retryable) this.pendingRetry.add(file.path);
 				this.notify(e.message);
 			}
 			if (!tag) {
@@ -436,6 +473,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 					if (!current || notesAreOurs(current.notes)) {
 						await this.client.updateTask(existingTaskId, { notes: link });
 					}
+					this.pendingRetry.delete(file.path);
+					await this.flushPendingRetries(file.path);
 				}
 				record.full = fullSig;
 				record.path = file.path;
@@ -459,6 +498,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 				await this.client.updateTask(existingTaskId, payload);
 				this.sent[existingTaskId] = { content: contentSig, full: fullSig, path: file.path };
 				await this.persist();
+				this.pendingRetry.delete(file.path);
+				await this.flushPendingRetries(file.path);
 				if (!manual) this.notifySuccess(`updated "${title}".`);
 				return; // keeps its ref
 			}
@@ -467,6 +508,22 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			// the note's existing ref (if it has one) so its display number
 			// stays stable across task recreation.
 			const newRef = plannedRef;
+			const isNewRef = typeof existingRef !== 'number';
+			if (isNewRef) this.refCounter = newRef + 1; // reserve the number before touching SP
+
+			// sp_task_ref never comes from SP - it's ours alone - so writing it
+			// first means a failure here has touched nothing external. Nothing
+			// was created, so this is just an ordinary failed send: release the
+			// reserved number and bail out, same as any other aborted send.
+			try {
+				await this.writeFrontmatterWithRetry(file, { sp_task_ref: newRef });
+			} catch (e) {
+				if (isNewRef) this.refCounter = newRef;
+				this.notify(`couldn't write to "${file.basename}"'s frontmatter (${e.message}); nothing was sent.`);
+				return;
+			}
+			await this.persist();
+
 			const createPayload = { title, tagIds };
 			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
@@ -475,12 +532,31 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			if (dueDay) createPayload.dueDay = dueDay;
 			else if (this.settings.noDueDateOnCreate) createPayload.dueDay = null;
 			const created = await this.client.createTask(createPayload);
-			if (typeof existingRef !== 'number') this.refCounter = newRef + 1;
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
-			await this.writeFrontmatter(file, { sp_task_id: created.id, sp_task_ref: newRef });
+
+			// The SP task now exists - a failure writing its id back must not
+			// look like an ordinary retryable failure, since retrying would
+			// just call createTask again and leave this one orphaned. The note
+			// already carries the correct ref number and title, so recovery
+			// doesn't need it copied from here: a duplicate is spottable in SP
+			// by two tasks sharing that same "#<ref>" title.
+			try {
+				await this.writeFrontmatterWithRetry(file, { sp_task_id: created.id });
+			} catch (e) {
+				await this.persist();
+				this.notify(
+					`created SP task "${title}" but couldn't record its id in "${file.basename}" (${e.message}). ` +
+						`If the next send creates a duplicate, look in Super Productivity for two tasks titled "#${newRef} ..." and remove the extra one.`
+				);
+				return;
+			}
+
 			await this.persist();
+			this.pendingRetry.delete(file.path);
+			await this.flushPendingRetries(file.path);
 			if (!manual) this.notifySuccess(`created "${title}".`);
 		} catch (e) {
+			if (e.retryable) this.pendingRetry.add(file.path);
 			this.notify(e.message);
 		}
 	}
