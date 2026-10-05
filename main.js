@@ -16,7 +16,10 @@ const DEFAULT_SETTINGS = {
 	projectTagPrefixes: 'Project/',
 	nextFieldName: 'next',
 	waitingOnFieldName: 'waiting_on',
+	startFieldName: 'start',
 	includeDeepLink: true,
+	noDueDateOnCreate: true,
+	defaultProjectName: 'Inbox',
 };
 
 const MIN_DEBOUNCE_MS = 250;
@@ -68,6 +71,27 @@ function parsePrefixList(raw) {
 		.map((s) => (s.endsWith('/') ? s : `${s}/`));
 }
 
+// A note's start value (YYYY-MM-DD, optionally followed by a time) becomes SP's
+// dueDay only when it is today or later, judged in local time. Past, missing
+// or unparseable values return null, meaning "don't send a due date".
+function startToDueDay(value) {
+	const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(toText(value));
+	if (!m) return null;
+	const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
+	const parsed = new Date(y, mo - 1, d);
+	if (parsed.getFullYear() !== y || parsed.getMonth() !== mo - 1 || parsed.getDate() !== d) return null;
+	const now = new Date();
+	if (parsed < new Date(now.getFullYear(), now.getMonth(), now.getDate())) return null;
+	return `${m[1]}-${m[2]}-${m[3]}`;
+}
+
+// Local-time YYYY-MM-DD for "today"; sorts correctly against a dueDay string.
+function localTodayStr() {
+	const n = new Date();
+	const pad = (v) => String(v).padStart(2, '0');
+	return `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}`;
+}
+
 function notesAreOurs(notes) {
 	if (!notes) return true;
 	if (notes.startsWith('obsidian://open?')) return true; // 0.1.0/0.2.0 format
@@ -116,7 +140,9 @@ class SPClient {
 				throw: false,
 			});
 		} catch (e) {
-			throw new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			const err = new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			err.retryable = true; // connectivity failure, not a rejection by SP itself - worth retrying once SP is back
+			throw err;
 		}
 
 		if (res.status === 401) {
@@ -202,6 +228,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		);
 
 		this._timers = new Map(); // path -> timeout id
+		this.pendingRetry = new Set(); // paths that failed to reach SP; retried opportunistically, in-memory only
 
 		this.addSettingTab(new SPTaskerSettingTab(this.app, this));
 
@@ -262,6 +289,20 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		await this.persist();
 	}
 
+	// Called right after any send actually reaches SP successfully - that's
+	// proof SP is back up, so opportunistically retry other notes that
+	// previously failed to connect, instead of polling on a timer. In-memory
+	// only: a note stuck here is forgotten on Obsidian restart and just falls
+	// back to needing a manual edit/send, same as before this existed.
+	async flushPendingRetries(excludePath) {
+		const paths = [...this.pendingRetry].filter((p) => p !== excludePath);
+		for (const path of paths) {
+			this.pendingRetry.delete(path);
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (file instanceof TFile) await this.sendFile(file, { manual: false });
+		}
+	}
+
 	// -- scheduling ------------------------------------------------------------
 
 	scheduleSend(file) {
@@ -309,6 +350,24 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		});
 	}
 
+	// processFrontMatter re-reads and re-parses the file fresh each call, so
+	// it can fail with a YAMLParseError on frontmatter that was valid when we
+	// last read the cache - typically because the user is still typing and
+	// briefly left it in an invalid state. That clears itself within a
+	// second or two, so a few short retries clear almost all of these before
+	// resorting to surfacing an error.
+	async writeFrontmatterWithRetry(file, fields, attempts = 4, baseDelayMs = 300) {
+		for (let i = 0; i < attempts; i++) {
+			try {
+				await this.writeFrontmatter(file, fields);
+				return;
+			} catch (e) {
+				if (i === attempts - 1) throw e;
+				await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** i));
+			}
+		}
+	}
+
 	buildTitle(nextText, waitingOn, file, ref) {
 		const template = waitingOn ? this.settings.waitingTitleTemplate : this.settings.titleTemplate;
 		let rendered = renderTemplate(template, { next: nextText, waitingOn, title: file.basename, ref });
@@ -346,6 +405,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			try {
 				project = await this.client.findProject(projectNames[0]);
 			} catch (e) {
+				if (e.retryable) this.pendingRetry.add(file.path);
 				this.notify(e.message);
 				return;
 			}
@@ -367,6 +427,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			try {
 				tag = await this.client.findTag(this.settings.reminderTagName);
 			} catch (e) {
+				if (e.retryable) this.pendingRetry.add(file.path);
 				this.notify(e.message);
 			}
 			if (!tag) {
@@ -376,6 +437,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 				tagName = tag.title || tag.name;
 			}
 		}
+
+		const dueDay = startToDueDay(fm[this.settings.startFieldName]);
 
 		const existingTaskId = fm.sp_task_id;
 		const existingRef = fm.sp_task_ref;
@@ -388,7 +451,9 @@ module.exports = class SPTaskerPlugin extends Plugin {
 		// to the live counter for a note that has never been assigned one.
 		const plannedRef = typeof existingRef === 'number' ? existingRef : this.refCounter;
 		let title = this.buildTitle(nextText, waitingOn, file, plannedRef);
-		let contentSig = [title, projectName, tagName].join(SEP);
+		// dueDay joins the signature only when present, so existing records
+		// (which never had one) keep matching and aren't needlessly re-sent.
+		let contentSig = [title, projectName, tagName].join(SEP) + (dueDay ? SEP + dueDay : '');
 		let fullSig = contentSig + SEP + file.path;
 
 		try {
@@ -409,6 +474,8 @@ module.exports = class SPTaskerPlugin extends Plugin {
 					if (!current || notesAreOurs(current.notes)) {
 						await this.client.updateTask(existingTaskId, { notes: link });
 					}
+					this.pendingRetry.delete(file.path);
+					await this.flushPendingRetries(file.path);
 				}
 				record.full = fullSig;
 				record.path = file.path;
@@ -424,10 +491,17 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			if (current && !current.isDone) {
 				const payload = { title, tagIds };
 				if (project) payload.projectId = project.id;
+				// Updates push a strictly future start. Today is sent only if the SP
+				// task has no date yet (start added after creation); otherwise it's left
+				// alone so a task the user pushed to a later day in SP isn't snapped
+				// back to today by an unrelated edit. Past starts are never sent.
+				if (dueDay && (dueDay > localTodayStr() || (dueDay === localTodayStr() && !current.dueDay && !current.dueWithTime))) payload.dueDay = dueDay;
 				if (link && notesAreOurs(current.notes)) payload.notes = link;
 				await this.client.updateTask(existingTaskId, payload);
 				this.sent[existingTaskId] = { content: contentSig, full: fullSig, path: file.path };
 				await this.persist();
+				this.pendingRetry.delete(file.path);
+				await this.flushPendingRetries(file.path);
 				if (!manual) this.notifySuccess(`updated "${title}".`);
 				return; // keeps its ref
 			}
@@ -436,16 +510,67 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			// the note's existing ref (if it has one) so its display number
 			// stays stable across task recreation.
 			const newRef = plannedRef;
+			const isNewRef = typeof existingRef !== 'number';
+			if (isNewRef) this.refCounter = newRef + 1; // reserve the number before touching SP
+
+			// sp_task_ref never comes from SP - it's ours alone - so writing it
+			// first means a failure here has touched nothing external. Nothing
+			// was created, so this is just an ordinary failed send: release the
+			// reserved number and bail out, same as any other aborted send.
+			try {
+				await this.writeFrontmatterWithRetry(file, { sp_task_ref: newRef });
+			} catch (e) {
+				if (isNewRef) this.refCounter = newRef;
+				this.notify(`couldn't write to "${file.basename}"'s frontmatter (${e.message}); nothing was sent.`);
+				return;
+			}
+			await this.persist();
+
 			const createPayload = { title, tagIds };
 			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
+			else if (this.settings.defaultProjectName) {
+				// SP files a new task under whichever project view is open unless
+				// the payload names a project (projectId can't be null). Pin notes
+				// with no Project/ tag to a fixed default instead. Best effort: a
+				// failed or missing lookup just falls back to SP's own behaviour.
+				try {
+					const fallback = await this.client.findProject(this.settings.defaultProjectName);
+					if (fallback) createPayload.projectId = fallback.id;
+				} catch (e) {
+					// ignore; createTask below surfaces any real connectivity problem
+				}
+			}
+			// SP's TaskService.add() stamps dueDay = today when its Today view is
+			// open, unless the payload carries a dueDay key at all; null opts out.
+			if (dueDay) createPayload.dueDay = dueDay;
+			else if (this.settings.noDueDateOnCreate) createPayload.dueDay = null;
 			const created = await this.client.createTask(createPayload);
-			if (typeof existingRef !== 'number') this.refCounter = newRef + 1;
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
-			await this.writeFrontmatter(file, { sp_task_id: created.id, sp_task_ref: newRef });
+
+			// The SP task now exists - a failure writing its id back must not
+			// look like an ordinary retryable failure, since retrying would
+			// just call createTask again and leave this one orphaned. The note
+			// already carries the correct ref number and title, so recovery
+			// doesn't need it copied from here: a duplicate is spottable in SP
+			// by two tasks sharing that same "#<ref>" title.
+			try {
+				await this.writeFrontmatterWithRetry(file, { sp_task_id: created.id });
+			} catch (e) {
+				await this.persist();
+				this.notify(
+					`created SP task "${title}" but couldn't record its id in "${file.basename}" (${e.message}). ` +
+						`If the next send creates a duplicate, look in Super Productivity for two tasks titled "#${newRef} ..." and remove the extra one.`
+				);
+				return;
+			}
+
 			await this.persist();
+			this.pendingRetry.delete(file.path);
+			await this.flushPendingRetries(file.path);
 			if (!manual) this.notifySuccess(`created "${title}".`);
 		} catch (e) {
+			if (e.retryable) this.pendingRetry.add(file.path);
 			this.notify(e.message);
 		}
 	}
@@ -583,6 +708,17 @@ class SPTaskerSettingTab extends PluginSettingTab {
 						},
 					},
 					{
+						name: '"Start" field name',
+						desc: "Frontmatter key read for a start date (YYYY-MM-DD). If it is today or later it becomes the task's due date in SP; past dates are ignored.",
+						control: {
+							type: 'text',
+							key: 'startFieldName',
+							placeholder: DEFAULT_SETTINGS.startFieldName,
+							defaultValue: DEFAULT_SETTINGS.startFieldName,
+							validate: requiredText('"Start" field name'),
+						},
+					},
+					{
 						name: 'Project tag prefixes',
 						desc: 'Comma-separated tag prefixes that mark a project, e.g. "Project/, Area/". Only the segment right after the prefix is used.',
 						control: {
@@ -594,9 +730,24 @@ class SPTaskerSettingTab extends PluginSettingTab {
 						},
 					},
 					{
+						name: 'Default project',
+						desc: 'SP project used for new tasks from notes with no project tag, so they do not land in whichever project view is open in SP. Must already exist in SP. Leave empty to let SP decide. Only affects task creation.',
+						control: {
+							type: 'text',
+							key: 'defaultProjectName',
+							placeholder: DEFAULT_SETTINGS.defaultProjectName,
+							defaultValue: DEFAULT_SETTINGS.defaultProjectName,
+						},
+					},
+					{
 						name: 'Include note link',
 						desc: "Add a link back to the note in the task's notes field.",
 						control: { type: 'toggle', key: 'includeDeepLink', defaultValue: DEFAULT_SETTINGS.includeDeepLink },
+					},
+					{
+						name: 'No due date on new tasks',
+						desc: "Create tasks without a due date, even while SP's Today view is open (SP otherwise schedules them for today). Only affects task creation.",
+						control: { type: 'toggle', key: 'noDueDateOnCreate', defaultValue: DEFAULT_SETTINGS.noDueDateOnCreate },
 					},
 					{
 						name: 'Reminder tag name',
