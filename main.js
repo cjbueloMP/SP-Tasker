@@ -19,6 +19,7 @@ const DEFAULT_SETTINGS = {
 	startFieldName: 'start',
 	includeDeepLink: true,
 	noDueDateOnCreate: true,
+	defaultProjectName: 'Inbox',
 };
 
 const MIN_DEBOUNCE_MS = 250;
@@ -490,10 +491,11 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			if (current && !current.isDone) {
 				const payload = { title, tagIds };
 				if (project) payload.projectId = project.id;
-				// Updates only push a strictly future start. Today (or past) is left
+				// Updates push a strictly future start. Today is sent only if the SP
+				// task has no date yet (start added after creation); otherwise it's left
 				// alone so a task the user pushed to a later day in SP isn't snapped
-				// back to today by an unrelated edit.
-				if (dueDay && dueDay > localTodayStr()) payload.dueDay = dueDay;
+				// back to today by an unrelated edit. Past starts are never sent.
+				if (dueDay && (dueDay > localTodayStr() || (dueDay === localTodayStr() && !current.dueDay && !current.dueWithTime))) payload.dueDay = dueDay;
 				if (link && notesAreOurs(current.notes)) payload.notes = link;
 				await this.client.updateTask(existingTaskId, payload);
 				this.sent[existingTaskId] = { content: contentSig, full: fullSig, path: file.path };
@@ -527,6 +529,18 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			const createPayload = { title, tagIds };
 			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
+			else if (this.settings.defaultProjectName) {
+				// SP files a new task under whichever project view is open unless
+				// the payload names a project (projectId can't be null). Pin notes
+				// with no Project/ tag to a fixed default instead. Best effort: a
+				// failed or missing lookup just falls back to SP's own behaviour.
+				try {
+					const fallback = await this.client.findProject(this.settings.defaultProjectName);
+					if (fallback) createPayload.projectId = fallback.id;
+				} catch (e) {
+					// ignore; createTask below surfaces any real connectivity problem
+				}
+			}
 			// SP's TaskService.add() stamps dueDay = today when its Today view is
 			// open, unless the payload carries a dueDay key at all; null opts out.
 			if (dueDay) createPayload.dueDay = dueDay;
@@ -713,6 +727,16 @@ class SPTaskerSettingTab extends PluginSettingTab {
 							placeholder: DEFAULT_SETTINGS.projectTagPrefixes,
 							defaultValue: DEFAULT_SETTINGS.projectTagPrefixes,
 							validate: requiredText('Project tag prefixes'),
+						},
+					},
+					{
+						name: 'Default project',
+						desc: 'SP project used for new tasks from notes with no project tag, so they do not land in whichever project view is open in SP. Must already exist in SP. Leave empty to let SP decide. Only affects task creation.',
+						control: {
+							type: 'text',
+							key: 'defaultProjectName',
+							placeholder: DEFAULT_SETTINGS.defaultProjectName,
+							defaultValue: DEFAULT_SETTINGS.defaultProjectName,
 						},
 					},
 					{
