@@ -71,18 +71,26 @@ function parsePrefixList(raw) {
 		.map((s) => (s.endsWith('/') ? s : `${s}/`));
 }
 
-// A note's start value (YYYY-MM-DD, optionally followed by a time) becomes SP's
-// dueDay only when it is today or later, judged in local time. Past, missing
-// or unparseable values return null, meaning "don't send a due date".
-function startToDueDay(value) {
+// A note's start value (YYYY-MM-DD, optionally followed by a time) as a real
+// calendar date, or null if it's missing or unparseable. Not time-sensitive.
+function parseStartDay(value) {
 	const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(toText(value));
 	if (!m) return null;
 	const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
 	const parsed = new Date(y, mo - 1, d);
 	if (parsed.getFullYear() !== y || parsed.getMonth() !== mo - 1 || parsed.getDate() !== d) return null;
+	return { day: `${m[1]}-${m[2]}-${m[3]}`, parsed };
+}
+
+// A note's start becomes SP's dueDay only when it is today or later, judged in
+// local time. Past, missing or unparseable values return null, meaning "don't
+// send a due date" (create separately turns a valid past start into today).
+function startToDueDay(value) {
+	const s = parseStartDay(value);
+	if (!s) return null;
 	const now = new Date();
-	if (parsed < new Date(now.getFullYear(), now.getMonth(), now.getDate())) return null;
-	return `${m[1]}-${m[2]}-${m[3]}`;
+	if (s.parsed < new Date(now.getFullYear(), now.getMonth(), now.getDate())) return null;
+	return s.day;
 }
 
 // Local-time YYYY-MM-DD for "today"; sorts correctly against a dueDay string.
@@ -543,7 +551,11 @@ module.exports = class SPTaskerPlugin extends Plugin {
 			}
 			// SP's TaskService.add() stamps dueDay = today when its Today view is
 			// open, unless the payload carries a dueDay key at all; null opts out.
+			// A valid but past start on a brand-new task (incl. one recreated after
+			// the old one was completed) means "due now": use today. This is
+			// create-only, so it can't snap back a task rescheduled in SP.
 			if (dueDay) createPayload.dueDay = dueDay;
+			else if (parseStartDay(fm[this.settings.startFieldName])) createPayload.dueDay = localTodayStr();
 			else if (this.settings.noDueDateOnCreate) createPayload.dueDay = null;
 			const created = await this.client.createTask(createPayload);
 			this.sent[created.id] = { content: contentSig, full: fullSig, path: file.path };
