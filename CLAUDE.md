@@ -12,16 +12,19 @@ session: the design decisions and invariants that aren't obvious from reading th
 
 ## Architecture
 
-- Source is a single TypeScript file, **`src/main.ts`** (`strict`, no runtime npm dependencies). The
-  Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*` etc.) only on
-  `.ts`, which is why it was converted from JS in 0.3.0 (see "Known scan findings"). **esbuild**
-  bundles it to the root `main.js` (CommonJS, `obsidian` external, deliberately **unminified** and no
-  sourcemap in release builds — the developer policies prohibit obfuscation and reviewers read it).
-  Root `main.js` is a build artifact and is **gitignored**; never edit it by hand. esbuild strips
-  types without checking them, so `npm run typecheck` is what actually enforces them.
+- Source is TypeScript (`strict`, no runtime npm dependencies): **`src/main.ts`** (plugin class, SP
+  REST client, settings tab) and **`src/helpers.ts`** (pure functions with no Obsidian or network
+  access — date/`start` rules, title templates, `readSent`, etc. — kept separate so they can be unit
+  tested). The Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*`
+  etc.) only on `.ts`, which is why it was converted from JS in 0.3.0 (see "Scan results and known
+  findings"). **esbuild** bundles it to the root `main.js` (CommonJS, `obsidian` external,
+  deliberately **unminified** and no sourcemap in release builds — the developer policies prohibit
+  obfuscation and reviewers read it). Root `main.js` is a build artifact and is **gitignored**;
+  never edit it by hand. esbuild strips types without checking them, so `npm run typecheck` is what
+  actually enforces them.
 - Commands: `npm run build` (one-off), `npm run dev` (watch), `npm run typecheck` (`tsc --noEmit`),
-  `npm run lint` (lints `src/` with `eslint-plugin-obsidianmd`, the ruleset the directory scanner
-  runs). `esbuild.config.mjs`, `eslint.config.mjs`, `tsconfig.json` are dev tooling and never
+  `npm test` (unit tests for `helpers.ts`), `npm run lint` (lints `src/` and `tests/` with
+  `eslint-plugin-obsidianmd`, the ruleset the directory scanner runs). `esbuild.config.mjs`, `eslint.config.mjs`, `tsconfig.json` are dev tooling and never
   shipped. The scanner tracks the lint plugin's latest version, so `npm update` before releasing —
   rules change between versions. `node_modules/` is gitignored. Release assets stay `main.js` +
   `manifest.json` only.
@@ -30,11 +33,19 @@ session: the design decisions and invariants that aren't obvious from reading th
 - Licensed MIT (`LICENSE`, © 2026 Collin Buelo). The directory requires a LICENSE file.
 - `manifest.json` / `versions.json` at repo root are Obsidian's plugin metadata. Bump both together
   when releasing (see "Releasing" below).
-- There is no test suite. `node` is not installed on the host, but the owner keeps a `node:24-slim`
-  Docker container with the repo bind-mounted at `/app`; check `docker ps` and run
-  `docker exec <name> sh -c 'cd /app && npm run typecheck && npm run lint && npm run build'`.
-  Passing those only proves it compiles and lints — behavior changes still need the plugin loaded in
-  Obsidian, so always tell the user that.
+- Tests: `tests/helpers.test.ts` uses Node's built-in `node:test` (no test dependency) and runs the
+  `.ts` directly via Node's type stripping (Node 22.18+/24), hence the explicit `.ts` import
+  extension in the test and `allowImportingTsExtensions` in `tsconfig.json`. `helpers.ts` must stay
+  *erasable* TypeScript (no enums, namespaces or constructor parameter properties) for that to work.
+  Time-dependent helpers take an optional `now`/`Date` argument so tests are deterministic. The
+  test file wraps `test`/`describe` once to satisfy `no-floating-promises`, in case the directory
+  scanner lints `tests/` too. `sendFile`, the REST client and the settings tab are **not** covered
+  — they need Obsidian objects, so they still need manual testing in Obsidian.
+- `node` is not installed on the host, but the owner keeps a `node:24-slim` Docker container with
+  the repo bind-mounted at `/app`; check `docker ps` and run
+  `docker exec <name> sh -c 'cd /app && npm run typecheck && npm test && npm run lint && npm run build'`.
+  Passing those only proves it compiles, lints and the helper tests pass — behavior changes in the
+  rest still need the plugin loaded in Obsidian, so always tell the user that.
 
 ## Data model (`data.json`, at `<vault>/.obsidian/plugins/sp-tasker/data.json`)
 
@@ -240,10 +251,17 @@ Requirements that bit or could bite this repo:
   `eslint-plugin-obsidianmd`, so a pinned old version passing is not proof the scan will pass.
 - Version bump per release is mandatory for fixes — the scanner re-scans new releases only.
 
-### Known scan findings (as of the 0.2.3 listing)
+### Scan results and known findings (listing at 0.3.0)
 
-The listed 0.2.3 passed review with only warnings/recommendations; none block the listing. Don't
-"fix" the accepted ones below without discussing.
+The 0.3.0 release scan (the first from the TypeScript source) reported: **Releases** pass (verified
+GitHub artifact attestation on `main.js`), **Dependencies** pass, **Code obfuscation** pass, **Build
+verification** pass (the scanner rebuilt `main.js` from the repo and reproduced the release asset
+byte-for-byte), and one **Behavior** recommendation (Vault Enumeration, below). This is why the
+release workflow must stay the only way release assets are built — a locally built `main.js`
+attached by hand would risk failing build verification. The 0.2.3 listing had only
+warnings/recommendations too; none block the listing. Don't "fix" the accepted items below without
+discussing. (The sentence-case and network-call items below were seen on the 0.2.3 scan and weren't
+repeated in the 0.3.0 summary — re-check the dashboard if unsure whether they still apply.)
 
 - **`@typescript-eslint/no-unsafe-*` warnings (~200 locations in the 0.2.3 JS).** The scanner
   applied type-aware rules to the untyped JS (every parameter was `any`); the lint plugin's own
