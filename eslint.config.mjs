@@ -7,7 +7,7 @@ export default defineConfig([
 	{ ignores: ["main.js", "node_modules/"] }, // main.js is the esbuild output; lint src/ instead
 	...obsidianmd.configs.recommended,
 	{
-		files: ["src/**/*.ts"],
+		files: ["src/**/*.ts", "tests/**/*.ts"],
 		languageOptions: {
 			parserOptions: {
 				projectService: {

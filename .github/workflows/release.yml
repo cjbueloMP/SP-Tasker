@@ -1,11 +1,21 @@
 name: Release Obsidian plugin
 
-# Push a tag that exactly matches manifest.json's version (no "v" prefix), e.g. `git tag 0.2.3 && git push origin 0.2.3`.
-# Creates a DRAFT release with the freshly built main.js + manifest.json; review the notes and publish it by hand.
+# Runs when a pull request is merged into main (a push to main). If manifest.json's version has no
+# release yet, it builds from that exact commit and creates a DRAFT release with main.js and
+# manifest.json attached. Review the generated notes and click Publish; publishing is what creates
+# the git tag (named exactly like the version, no "v") on the commit below.
+#
+# Everything happens in this one workflow on purpose: events triggered by the built-in GITHUB_TOKEN
+# (such as a tag it creates) do not start other workflow runs, so a separate tag-triggered workflow
+# would never fire.
 on:
   push:
-    tags:
-      - "*"
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -18,34 +28,57 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # also fetches tags
+
+      - name: Read version and check for an existing release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p "require('./manifest.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::manifest.json version '$version' must be plain x.y.z (no 'v' prefix)."
+            exit 1
+          fi
+          existing=false
+          if git rev-parse -q --verify "refs/tags/$version" >/dev/null; then existing=true; fi
+          if gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -Fxq "$version"; then existing=true; fi
+          echo "existing=$existing" >> "$GITHUB_OUTPUT"
+          if [ "$existing" = true ]; then
+            echo "Release $version already exists (tag or release/draft); nothing to do."
+          fi
 
       - name: Use Node.js
+        if: steps.version.outputs.existing != 'true'
         uses: actions/setup-node@v7
         with:
           node-version: "lts/*"
           cache: npm
 
-      - name: Check tag matches manifest version
-        run: |
-          version=$(node -p "require('./manifest.json').version")
-          if [ "$GITHUB_REF_NAME" != "$version" ]; then
-            echo "::error::Tag '$GITHUB_REF_NAME' does not match manifest.json version '$version' (tags must not have a 'v' prefix)."
-            exit 1
-          fi
-
       - name: Install dependencies
+        if: steps.version.outputs.existing != 'true'
         run: npm ci
 
       - name: Type check
+        if: steps.version.outputs.existing != 'true'
         run: npm run typecheck
 
+      - name: Test
+        if: steps.version.outputs.existing != 'true'
+        run: npm test
+
       - name: Lint
+        if: steps.version.outputs.existing != 'true'
         run: npm run lint
 
       - name: Build plugin
+        if: steps.version.outputs.existing != 'true'
         run: npm run build
 
       - name: Generate artifact attestation
+        if: steps.version.outputs.existing != 'true'
         uses: actions/attest@v4
         with:
           subject-path: |
@@ -53,10 +86,14 @@ jobs:
             manifest.json
 
       - name: Create draft release
+        if: steps.version.outputs.existing != 'true'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title="$GITHUB_REF_NAME" \
+          gh release create "$VERSION" \
+            --title="$VERSION" \
             --draft \
+            --generate-notes \
+            --target "$GITHUB_SHA" \
             main.js manifest.json

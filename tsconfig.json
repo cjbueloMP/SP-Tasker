@@ -4,9 +4,10 @@
 		"noEmit": true,
 		"module": "ESNext",
 		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
 		"target": "ES2018",
 		"lib": ["ES2022", "DOM"],
 		"skipLibCheck": true
 	},
-	"include": ["src/**/*.ts"]
+	"include": ["src/**/*.ts", "tests/**/*.ts"]
 }

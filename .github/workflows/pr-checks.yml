@@ -1,0 +1,56 @@
+name: PR checks
+
+# Required status check for main (see CLAUDE.md "Branch protection"). Every merge to main becomes a
+# release, so this also insists on a new, consistent version.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # also fetches tags, which the version check needs
+
+      - name: Use Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "lts/*"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: List existing releases (including drafts)
+        id: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo 'tags<<EOF'
+            gh release list --limit 200 --json tagName --jq '.[].tagName' || true
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check version is new and consistent
+        env:
+          RELEASE_TAGS: ${{ steps.releases.outputs.tags }}
+        run: node .github/scripts/check-release-ready.mjs

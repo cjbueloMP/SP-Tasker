@@ -12,16 +12,23 @@ session: the design decisions and invariants that aren't obvious from reading th
 
 ## Architecture
 
-- Source is a single TypeScript file, **`src/main.ts`** (`strict`, no runtime npm dependencies). The
-  Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*` etc.) only on
-  `.ts`, which is why it was converted from JS in 0.3.0 (see "Known scan findings"). **esbuild**
-  bundles it to the root `main.js` (CommonJS, `obsidian` external, deliberately **unminified** and no
-  sourcemap in release builds — the developer policies prohibit obfuscation and reviewers read it).
-  Root `main.js` is a build artifact and is **gitignored**; never edit it by hand. esbuild strips
-  types without checking them, so `npm run typecheck` is what actually enforces them.
+- Source is TypeScript (`strict`, no runtime npm dependencies), in `src/`: **`main.ts`** (the plugin
+  class: lifecycle, commands, scheduling, `sendFile`), **`sp-client.ts`** (`SPClient` REST client,
+  `SPApiError`, SP task/project/tag types), **`settings.ts`** (`SPSettings`, `DEFAULT_SETTINGS`,
+  `MIN_DEBOUNCE_MS`, the settings tab) and **`helpers.ts`** (pure functions with no Obsidian or
+  network access — date/`start` rules, title templates, `readSent`, etc. — so they can be unit
+  tested). `settings.ts` doesn't import `main.ts`: the tab talks to the plugin through the small
+  `SettingsHost` interface, so there is no import cycle. Only `main.ts` should know the data.json
+  shape (`PersistedData`). The Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*`
+  etc.) only on `.ts`, which is why it was converted from JS in 0.3.0 (see "Scan results and known
+  findings"). **esbuild** bundles it to the root `main.js` (CommonJS, `obsidian` external,
+  deliberately **unminified** and no sourcemap in release builds — the developer policies prohibit
+  obfuscation and reviewers read it). Root `main.js` is a build artifact and is **gitignored**;
+  never edit it by hand. esbuild strips types without checking them, so `npm run typecheck` is what
+  actually enforces them.
 - Commands: `npm run build` (one-off), `npm run dev` (watch), `npm run typecheck` (`tsc --noEmit`),
-  `npm run lint` (lints `src/` with `eslint-plugin-obsidianmd`, the ruleset the directory scanner
-  runs). `esbuild.config.mjs`, `eslint.config.mjs`, `tsconfig.json` are dev tooling and never
+  `npm test` (unit tests for `helpers.ts`), `npm run lint` (lints `src/` and `tests/` with
+  `eslint-plugin-obsidianmd`, the ruleset the directory scanner runs). `esbuild.config.mjs`, `eslint.config.mjs`, `tsconfig.json` are dev tooling and never
   shipped. The scanner tracks the lint plugin's latest version, so `npm update` before releasing —
   rules change between versions. `node_modules/` is gitignored. Release assets stay `main.js` +
   `manifest.json` only.
@@ -30,11 +37,19 @@ session: the design decisions and invariants that aren't obvious from reading th
 - Licensed MIT (`LICENSE`, © 2026 Collin Buelo). The directory requires a LICENSE file.
 - `manifest.json` / `versions.json` at repo root are Obsidian's plugin metadata. Bump both together
   when releasing (see "Releasing" below).
-- There is no test suite. `node` is not installed on the host, but the owner keeps a `node:24-slim`
-  Docker container with the repo bind-mounted at `/app`; check `docker ps` and run
-  `docker exec <name> sh -c 'cd /app && npm run typecheck && npm run lint && npm run build'`.
-  Passing those only proves it compiles and lints — behavior changes still need the plugin loaded in
-  Obsidian, so always tell the user that.
+- Tests: `tests/helpers.test.ts` uses Node's built-in `node:test` (no test dependency) and runs the
+  `.ts` directly via Node's type stripping (Node 22.18+/24), hence the explicit `.ts` import
+  extension in the test and `allowImportingTsExtensions` in `tsconfig.json`. `helpers.ts` must stay
+  *erasable* TypeScript (no enums, namespaces or constructor parameter properties) for that to work.
+  Time-dependent helpers take an optional `now`/`Date` argument so tests are deterministic. The
+  test file wraps `test`/`describe` once to satisfy `no-floating-promises`, in case the directory
+  scanner lints `tests/` too. `sendFile`, the REST client and the settings tab are **not** covered
+  — they need Obsidian objects, so they still need manual testing in Obsidian.
+- `node` is not installed on the host, but the owner keeps a `node:24-slim` Docker container with
+  the repo bind-mounted at `/app`; check `docker ps` and run
+  `docker exec <name> sh -c 'cd /app && npm run typecheck && npm test && npm run lint && npm run build'`.
+  Passing those only proves it compiles, lints and the helper tests pass — behavior changes in the
+  rest still need the plugin loaded in Obsidian, so always tell the user that.
 
 ## Data model (`data.json`, at `<vault>/.obsidian/plugins/sp-tasker/data.json`)
 
@@ -191,29 +206,46 @@ fallback. Two API details that aren't obvious from a first read of `obsidian.d.t
 
 ## Releasing
 
-1. Bump `version` in `manifest.json` and add the matching entry to `versions.json` (both keyed
-   identically, e.g. `"0.2.0": "1.13.7"`). In pre-1.0 semver, a breaking change bumps the **minor**
-   version (`0.1.x` → `0.2.0`), not just the patch.
-2. Tag the release commit with the version number **exactly**, no `v` prefix (e.g. `0.2.0`, not
-   `v0.2.0`) — this is what both BRAT and Obsidian's own installer match against. (The directory
-   preview scan flagged an earlier `v`-prefixed tag.)
-3. Push the tag. `.github/workflows/release.yml` then checks the tag equals `manifest.json`'s
-   version (fails on a `v` prefix), runs `npm ci`, lint and build, attests the artifacts, and
-   creates a **draft** GitHub Release with the freshly built `main.js` and `manifest.json` attached
-   as individual binary assets. Add release notes and publish the draft by hand. Those two assets
-   are what BRAT and Obsidian's installer actually download; they ignore the source archive
-   entirely. The release is built in CI from the tagged commit — don't attach a locally built
-   `main.js`. Requires `package-lock.json` to be committed (for `npm ci`). The workflow's own
-   `permissions:` block requests `contents: write`; Obsidian's guide also says to set repo Settings
-   → Actions → General → Workflow permissions to read and write (GitHub's docs say a workflow's
-   `permissions` key can raise access on its own, unless an org restricts it — so that setting is
-   a fallback if the release step gets a 403). Free for public repos.
+Every merge to `main` is a release. `main` is protected (see "Branch protection" below) and only
+changes through a pull request (merge-commit method, so the branch's commit hashes are preserved).
+
+1. On a feature branch, bump `version` in `manifest.json` and add the matching entry to
+   `versions.json` (both keyed identically, e.g. `"0.2.0": "1.13.7"`). In pre-1.0 semver, a breaking
+   change bumps the **minor** version (`0.1.x` → `0.2.0`), not just the patch.
+2. Open a PR into `main`. `.github/workflows/pr-checks.yml` runs typecheck, tests, lint and build,
+   plus `.github/scripts/check-release-ready.mjs`, which fails the PR unless the version is plain
+   `x.y.z`, has no existing tag or release (drafts included), is not lower than an existing release,
+   and `versions.json` maps it to `minAppVersion`.
+3. Merge the PR (merge commit). `.github/workflows/release.yml` runs on the push to `main`: if
+   `manifest.json`'s version has no tag/release yet, it reruns the checks, builds, attests, and
+   creates a **draft** GitHub Release (generated notes) with the freshly built `main.js` and
+   `manifest.json` attached as individual binary assets, targeted at the exact merge commit.
+   Review the notes and **Publish** the draft by hand — publishing creates the git tag, named
+   exactly like the version with **no `v` prefix** (what BRAT and Obsidian's installer match; the
+   directory scan flagged an earlier `v` tag). Don't tag by hand or attach a locally built
+   `main.js`: the scanner rebuilds `main.js` from the tag's commit and compares it byte-for-byte.
+   If the version already has a release the workflow does nothing, so a docs-only merge is safe.
+   The whole thing lives in one workflow on purpose: a tag created with the built-in `GITHUB_TOKEN`
+   would not trigger a second, tag-triggered workflow (GitHub suppresses that). Needs
+   `package-lock.json` committed (for `npm ci`) and `contents: write` (requested in the workflow's
+   `permissions:`); Obsidian's guide also says to set repo Settings → Actions → General → Workflow
+   permissions to read and write — GitHub's docs say the `permissions` key can raise access on its
+   own, so that setting is only a fallback if the release step gets a 403. Free for public repos.
+   *Unverified on first use:* whether a draft's tag shows up in `git tag` before it is published
+   (the existing-release check also looks at `gh release list`, which includes drafts, to be safe),
+   and `--generate-notes` / `--target <sha>` behavior in `gh release create`.
 4. BRAT compatibility checklist: valid `manifest.json` at repo root (✓), a release tagged to match
-   `version` with `main.js`+`manifest.json` attached (✓ once step 3 is done), repo must be public
+   `version` with `main.js`+`manifest.json` attached (✓ once the draft is published), repo must be public
    (or BRAT needs a PAT for a private repo). `versions.json` is *not* required by BRAT — that file
    matters for Obsidian's own Community Plugins updater, which this plugin isn't listed on.
 5. Manual install on a second machine (non-BRAT): download `main.js`/`manifest.json` from the
    release assets, place both in `<vault>/.obsidian/plugins/sp-tasker/`, enable in Obsidian.
+
+### Branch protection (GitHub ruleset on `main`, set up by the owner in repo settings)
+
+Require a pull request (approvals 0 — you can't approve your own), require the `PR checks` →
+`checks` status check, block force pushes. Don't enable "Require linear history": it forbids merge
+commits, which is the chosen merge method. Claude cannot change these settings.
 
 ## Community directory submission
 
@@ -240,10 +272,17 @@ Requirements that bit or could bite this repo:
   `eslint-plugin-obsidianmd`, so a pinned old version passing is not proof the scan will pass.
 - Version bump per release is mandatory for fixes — the scanner re-scans new releases only.
 
-### Known scan findings (as of the 0.2.3 listing)
+### Scan results and known findings (listing at 0.3.0)
 
-The listed 0.2.3 passed review with only warnings/recommendations; none block the listing. Don't
-"fix" the accepted ones below without discussing.
+The 0.3.0 release scan (the first from the TypeScript source) reported: **Releases** pass (verified
+GitHub artifact attestation on `main.js`), **Dependencies** pass, **Code obfuscation** pass, **Build
+verification** pass (the scanner rebuilt `main.js` from the repo and reproduced the release asset
+byte-for-byte), and one **Behavior** recommendation (Vault Enumeration, below). This is why the
+release workflow must stay the only way release assets are built — a locally built `main.js`
+attached by hand would risk failing build verification. The 0.2.3 listing had only
+warnings/recommendations too; none block the listing. Don't "fix" the accepted items below without
+discussing. (The sentence-case and network-call items below were seen on the 0.2.3 scan and weren't
+repeated in the 0.3.0 summary — re-check the dashboard if unsure whether they still apply.)
 
 - **`@typescript-eslint/no-unsafe-*` warnings (~200 locations in the 0.2.3 JS).** The scanner
   applied type-aware rules to the untyped JS (every parameter was `any`); the lint plugin's own
