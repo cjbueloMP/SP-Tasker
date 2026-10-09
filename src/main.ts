@@ -1,8 +1,72 @@
 import { Plugin, PluginSettingTab, Notice, TFile, requestUrl, getAllTags } from 'obsidian';
+import type { TAbstractFile, SettingDefinitionItem } from 'obsidian';
 
 const SEP = String.fromCharCode(1); // avoids a literal control byte in the source
 
-const DEFAULT_SETTINGS = {
+// ---------------------------------------------------------------------------
+// types
+// ---------------------------------------------------------------------------
+
+// A type alias (not an interface) so it is assignable to Record<string, unknown>,
+// which the settings tab needs to read/write controls by key.
+type SPSettings = {
+	apiBaseUrl: string;
+	apiToken: string;
+	reminderTagName: string;
+	autoSync: boolean;
+	debounceMs: number;
+	titleTemplate: string;
+	waitingTitleTemplate: string;
+	showRefInTitle: boolean;
+	projectTagPrefixes: string;
+	nextFieldName: string;
+	waitingOnFieldName: string;
+	startFieldName: string;
+	includeDeepLink: boolean;
+	noDueDateOnCreate: boolean;
+	defaultProjectName: string;
+};
+
+interface SentRecord {
+	content: string;
+	full: string;
+	path: string;
+}
+type SentMap = Record<string, SentRecord>;
+
+interface PersistedData {
+	settings?: Partial<SPSettings>;
+	sent?: unknown;
+	refCounter?: unknown;
+}
+
+// The parts of SP's task / project / tag objects this plugin reads.
+interface SPTask {
+	id: string;
+	isDone?: boolean;
+	notes?: string;
+	dueDay?: string | null;
+	dueWithTime?: number | null;
+}
+interface SPNamed {
+	id: string;
+	title?: string;
+	name?: string;
+}
+interface TaskPayload {
+	title: string;
+	tagIds: string[];
+	notes?: string;
+	projectId?: string;
+	dueDay?: string | null;
+}
+interface SPEnvelope {
+	ok?: boolean;
+	data?: unknown;
+	error?: { code: string; message: string };
+}
+
+const DEFAULT_SETTINGS: SPSettings = {
 	apiBaseUrl: 'http://127.0.0.1:3876',
 	apiToken: '',
 	reminderTagName: 'reminder',
@@ -27,15 +91,21 @@ const TITLE_MAX_LEN = 300;
 // small helpers
 // ---------------------------------------------------------------------------
 
-function toText(value) {
+function errMsg(e: unknown): string {
+	return e instanceof Error ? e.message : String(e);
+}
+
+function toText(value: unknown): string {
 	if (value === undefined || value === null) return '';
-	if (Array.isArray(value)) return value.map(toText).filter(Boolean).join(' ');
-	return String(value).trim();
+	if (Array.isArray(value)) return (value as unknown[]).map(toText).filter(Boolean).join(' ');
+	if (typeof value === 'string') return value.trim();
+	if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+	return ''; // a YAML map etc. is not a usable title (previously became "[object Object]")
 }
 
 // "Alex" / "Alex and Sam" / "Alex, Sam and Jo" - deduped, no Oxford comma.
-function joinGrammatical(items) {
-	const seen = [];
+function joinGrammatical(items: unknown[]): string {
+	const seen: string[] = [];
 	for (const raw of items) {
 		const s = String(raw).trim();
 		if (s && !seen.includes(s)) seen.push(s);
@@ -46,7 +116,10 @@ function joinGrammatical(items) {
 	return `${seen.slice(0, -1).join(', ')} and ${seen[seen.length - 1]}`;
 }
 
-function renderTemplate(template, { next, waitingOn, title, ref }) {
+function renderTemplate(
+	template: string,
+	{ next, waitingOn, title, ref }: { next: string; waitingOn: string; title: string; ref: number }
+): string {
 	return template
 		.replace(/\{next\}/g, next)
 		.replace(/\{waiting_on\}/g, waitingOn)
@@ -56,12 +129,12 @@ function renderTemplate(template, { next, waitingOn, title, ref }) {
 
 // encodeURIComponent leaves ( and ) alone, and an unescaped ) would
 // terminate a markdown link early.
-function encodeLinkComponent(str) {
+function encodeLinkComponent(str: string): string {
 	return encodeURIComponent(str).replace(/\(/g, '%28').replace(/\)/g, '%29');
 }
 
 // "Project/, Area/" -> ["Project/", "Area/"], each guaranteed to end with "/".
-function parsePrefixList(raw) {
+function parsePrefixList(raw: string): string[] {
 	return String(raw || '')
 		.split(',')
 		.map((s) => s.trim())
@@ -71,7 +144,7 @@ function parsePrefixList(raw) {
 
 // A note's start value (YYYY-MM-DD, optionally followed by a time) as a real
 // calendar date, or null if it's missing or unparseable. Not time-sensitive.
-function parseStartDay(value) {
+function parseStartDay(value: unknown): { day: string; parsed: Date } | null {
 	const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(toText(value));
 	if (!m) return null;
 	const [y, mo, d] = [Number(m[1]), Number(m[2]), Number(m[3])];
@@ -83,7 +156,7 @@ function parseStartDay(value) {
 // A note's start becomes SP's dueDay only when it is today or later, judged in
 // local time. Past, missing or unparseable values return null, meaning "don't
 // send a due date" (create separately turns a valid past start into today).
-function startToDueDay(value) {
+function startToDueDay(value: unknown): string | null {
 	const s = parseStartDay(value);
 	if (!s) return null;
 	const now = new Date();
@@ -92,24 +165,27 @@ function startToDueDay(value) {
 }
 
 // Local-time YYYY-MM-DD for "today"; sorts correctly against a dueDay string.
-function localTodayStr() {
+function localTodayStr(): string {
 	const n = new Date();
-	const pad = (v) => String(v).padStart(2, '0');
+	const pad = (v: number) => String(v).padStart(2, '0');
 	return `${n.getFullYear()}-${pad(n.getMonth() + 1)}-${pad(n.getDate())}`;
 }
 
-function notesAreOurs(notes) {
+function notesAreOurs(notes: string | null | undefined): boolean {
 	if (!notes) return true;
 	if (notes.startsWith('obsidian://open?')) return true; // 0.1.0/0.2.0 format
 	return /^\[[^\]]*\]\(obsidian:\/\/open\?[^)]*\)$/.test(notes);
 }
 
-function readSent(raw) {
-	const out = {};
+function readSent(raw: unknown): SentMap {
+	const out: SentMap = {};
 	if (!raw || typeof raw !== 'object') return out;
-	for (const [taskId, val] of Object.entries(raw)) {
-		if (val && typeof val === 'object' && typeof val.full === 'string') {
-			out[taskId] = { content: val.content || '', full: val.full, path: val.path || '' };
+	for (const [taskId, val] of Object.entries(raw as Record<string, unknown>)) {
+		if (val && typeof val === 'object') {
+			const v = val as Partial<SentRecord>;
+			if (typeof v.full === 'string') {
+				out[taskId] = { content: v.content || '', full: v.full, path: v.path || '' };
+			}
 		}
 	}
 	return out;
@@ -119,17 +195,24 @@ function readSent(raw) {
 // Super Productivity REST client
 // ---------------------------------------------------------------------------
 
-class SPApiError extends Error {}
+class SPApiError extends Error {
+	retryable?: boolean;
+}
+
+function isRetryable(e: unknown): boolean {
+	return e instanceof SPApiError && e.retryable === true;
+}
 
 class SPClient {
-	constructor(getBaseUrl, getToken) {
-		this.getBaseUrl = getBaseUrl;
-		this.getToken = getToken;
-		this.projectCache = null;
-		this.tagCache = null;
-	}
+	private projectCache: SPNamed[] | null = null;
+	private tagCache: SPNamed[] | null = null;
 
-	async request(method, path, { body } = {}) {
+	constructor(
+		private readonly getBaseUrl: () => string,
+		private readonly getToken: () => string
+	) {}
+
+	async request<T>(method: string, path: string, { body }: { body?: unknown } = {}): Promise<T | undefined> {
 		const base = this.getBaseUrl().replace(/\/+$/, '');
 		const url = `${base}${path}`;
 
@@ -146,7 +229,7 @@ class SPClient {
 				throw: false,
 			});
 		} catch (e) {
-			const err = new SPApiError(`Could not reach Super Productivity at ${base} (${e.message}). Is the app running with the local REST API enabled?`);
+			const err = new SPApiError(`Could not reach Super Productivity at ${base} (${errMsg(e)}). Is the app running with the local REST API enabled?`);
 			err.retryable = true; // connectivity failure, not a rejection by SP itself - worth retrying once SP is back
 			throw err;
 		}
@@ -155,9 +238,9 @@ class SPClient {
 			throw new SPApiError('Super Productivity access token rejected.');
 		}
 
-		let json;
+		let json: SPEnvelope | undefined;
 		try {
-			json = res.json;
+			json = res.json as SPEnvelope | undefined;
 		} catch {
 			json = undefined;
 		}
@@ -170,50 +253,56 @@ class SPClient {
 			throw new SPApiError(`Super Productivity API error (${method} ${path}): ${msg}`);
 		}
 		if (json && json.ok === false) {
-			throw new SPApiError(`Super Productivity API error (${method} ${path}): ${json.error.code}: ${json.error.message}`);
+			const detail = json.error ? `${json.error.code}: ${json.error.message}` : 'unknown error';
+			throw new SPApiError(`Super Productivity API error (${method} ${path}): ${detail}`);
 		}
-		return json ? json.data : undefined;
+		return json ? (json.data as T) : undefined;
 	}
 
-	health() {
+	health(): Promise<unknown> {
 		return this.request('GET', '/health');
 	}
 
-	async getTask(id) {
+	async getTask(id: string): Promise<SPTask | null> {
 		try {
-			return await this.request('GET', `/tasks/${encodeURIComponent(id)}`);
+			return (await this.request<SPTask>('GET', `/tasks/${encodeURIComponent(id)}`)) ?? null;
 		} catch (e) {
 			if (e instanceof SPApiError && /HTTP 404|TASK_NOT_FOUND/.test(e.message)) return null;
 			throw e;
 		}
 	}
 
-	createTask(payload) {
-		return this.request('POST', '/tasks', { body: payload });
+	async createTask(payload: TaskPayload): Promise<SPTask> {
+		const task = await this.request<SPTask>('POST', '/tasks', { body: payload });
+		if (!task) throw new SPApiError('Super Productivity API returned no task for the create request.');
+		return task;
 	}
 
-	updateTask(id, payload) {
+	updateTask(id: string, payload: Partial<TaskPayload>): Promise<unknown> {
 		return this.request('PATCH', `/tasks/${encodeURIComponent(id)}`, { body: payload });
 	}
 
-	findProject(name) {
+	findProject(name: string): Promise<SPNamed | null> {
 		return this._findCached('projectCache', '/projects', name);
 	}
 
-	findTag(name) {
+	findTag(name: string): Promise<SPNamed | null> {
 		return this._findCached('tagCache', '/tags', name);
 	}
 
 	// Case-sensitive exact match against title (or name), cached in memory
 	// with exactly one refetch on a miss.
-	async _findCached(cacheKey, path, name) {
-		if (!this[cacheKey]) this[cacheKey] = (await this.request('GET', path)) || [];
-		let found = this[cacheKey].find((i) => i.title === name || i.name === name);
+	private async _findCached(cacheKey: 'projectCache' | 'tagCache', path: string, name: string): Promise<SPNamed | null> {
+		const matches = (i: SPNamed) => i.title === name || i.name === name;
+		const cached = this[cacheKey] ?? (await this.request<SPNamed[]>('GET', path)) ?? [];
+		this[cacheKey] = cached;
+		let found = cached.find(matches);
 		if (!found) {
-			this[cacheKey] = (await this.request('GET', path)) || [];
-			found = this[cacheKey].find((i) => i.title === name || i.name === name);
+			const fresh = (await this.request<SPNamed[]>('GET', path)) ?? [];
+			this[cacheKey] = fresh;
+			found = fresh.find(matches);
 		}
-		return found || null;
+		return found ?? null;
 	}
 }
 
@@ -222,9 +311,16 @@ class SPClient {
 // ---------------------------------------------------------------------------
 
 export default class SPTaskerPlugin extends Plugin {
+	settings!: SPSettings;
+	sent!: SentMap;
+	refCounter!: number;
+	client!: SPClient;
+	private _timers!: Map<string, number>; // path -> timeout id
+	private pendingRetry!: Set<string>; // paths that failed to reach SP; retried opportunistically, in-memory only
+
 	async onload() {
-		const loaded = (await this.loadData()) || {};
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded.settings);
+		const loaded = ((await this.loadData()) as PersistedData | null) ?? {};
+		this.settings = { ...DEFAULT_SETTINGS, ...loaded.settings };
 		this.sent = readSent(loaded.sent);
 		this.refCounter = typeof loaded.refCounter === 'number' ? loaded.refCounter : 1;
 
@@ -233,8 +329,8 @@ export default class SPTaskerPlugin extends Plugin {
 			() => this.settings.apiToken
 		);
 
-		this._timers = new Map(); // path -> timeout id
-		this.pendingRetry = new Set(); // paths that failed to reach SP; retried opportunistically, in-memory only
+		this._timers = new Map();
+		this.pendingRetry = new Set();
 
 		this.addSettingTab(new SPTaskerSettingTab(this.app, this));
 
@@ -247,7 +343,7 @@ export default class SPTaskerPlugin extends Plugin {
 					new Notice('SP Tasker: no active note.');
 					return;
 				}
-				this.sendFile(file, { manual: true });
+				void this.sendFile(file, { manual: true });
 			},
 		});
 
@@ -265,7 +361,7 @@ export default class SPTaskerPlugin extends Plugin {
 			})
 		);
 
-		this.app.workspace.onLayoutReady(() => this.healCounter());
+		this.app.workspace.onLayoutReady(() => void this.healCounter());
 	}
 
 	onunload() {
@@ -277,12 +373,12 @@ export default class SPTaskerPlugin extends Plugin {
 		await this.saveData({ settings: this.settings, sent: this.sent, refCounter: this.refCounter });
 	}
 
-	notify(msg) {
+	notify(msg: string) {
 		new Notice(`SP Tasker: ${msg}`);
 		console.error(`[SP Tasker] ${msg}`);
 	}
 
-	notifySuccess(msg) {
+	notifySuccess(msg: string) {
 		new Notice(`SP Tasker: ${msg}`);
 	}
 
@@ -300,7 +396,7 @@ export default class SPTaskerPlugin extends Plugin {
 	// previously failed to connect, instead of polling on a timer. In-memory
 	// only: a note stuck here is forgotten on Obsidian restart and just falls
 	// back to needing a manual edit/send, same as before this existed.
-	async flushPendingRetries(excludePath) {
+	async flushPendingRetries(excludePath: string) {
 		const paths = [...this.pendingRetry].filter((p) => p !== excludePath);
 		for (const path of paths) {
 			this.pendingRetry.delete(path);
@@ -311,25 +407,29 @@ export default class SPTaskerPlugin extends Plugin {
 
 	// -- scheduling ------------------------------------------------------------
 
-	scheduleSend(file) {
+	scheduleSend(file: TAbstractFile) {
 		if (!(file instanceof TFile) || file.extension !== 'md') return;
 		const existing = this._timers.get(file.path);
 		if (existing) window.clearTimeout(existing);
 		const delay = Math.max(this.settings.debounceMs, MIN_DEBOUNCE_MS);
 		const timer = window.setTimeout(() => {
 			this._timers.delete(file.path);
-			this.sendFile(file, { manual: false });
+			void this.sendFile(file, { manual: false });
 		}, delay);
 		this._timers.set(file.path, timer);
 	}
 
 	// -- note inspection ---------------------------------------------------------
 
-	resolveProjectNames(file) {
+	frontmatterOf(file: TFile): Record<string, unknown> | undefined {
+		return this.app.metadataCache.getFileCache(file)?.frontmatter;
+	}
+
+	resolveProjectNames(file: TFile): string[] {
 		const cache = this.app.metadataCache.getFileCache(file);
 		const tags = (cache && getAllTags(cache)) || [];
 		const prefixes = parsePrefixList(this.settings.projectTagPrefixes);
-		const names = new Set();
+		const names = new Set<string>();
 		for (const t of tags) {
 			const clean = t.replace(/^#/, '');
 			for (const prefix of prefixes) {
@@ -343,15 +443,15 @@ export default class SPTaskerPlugin extends Plugin {
 		return [...names];
 	}
 
-	buildDeepLink(file) {
+	buildDeepLink(file: TFile): string {
 		const vault = encodeLinkComponent(this.app.vault.getName());
 		const path = encodeLinkComponent(file.path.replace(/\.md$/i, ''));
 		const label = file.basename.replace(/[[\]]/g, '') || 'Open in Obsidian';
 		return `[${label}](obsidian://open?vault=${vault}&file=${path})`;
 	}
 
-	async writeFrontmatter(file, fields) {
-		await this.app.fileManager.processFrontMatter(file, (fm) => {
+	async writeFrontmatter(file: TFile, fields: Record<string, unknown>) {
+		await this.app.fileManager.processFrontMatter(file, (fm: Record<string, unknown>) => {
 			Object.assign(fm, fields);
 		});
 	}
@@ -362,7 +462,7 @@ export default class SPTaskerPlugin extends Plugin {
 	// briefly left it in an invalid state. That clears itself within a
 	// second or two, so a few short retries clear almost all of these before
 	// resorting to surfacing an error.
-	async writeFrontmatterWithRetry(file, fields, attempts = 4, baseDelayMs = 300) {
+	async writeFrontmatterWithRetry(file: TFile, fields: Record<string, unknown>, attempts = 4, baseDelayMs = 300) {
 		for (let i = 0; i < attempts; i++) {
 			try {
 				await this.writeFrontmatter(file, fields);
@@ -374,7 +474,7 @@ export default class SPTaskerPlugin extends Plugin {
 		}
 	}
 
-	buildTitle(nextText, waitingOn, file, ref) {
+	buildTitle(nextText: string, waitingOn: string, file: TFile, ref: number): string {
 		const template = waitingOn ? this.settings.waitingTitleTemplate : this.settings.titleTemplate;
 		let rendered = renderTemplate(template, { next: nextText, waitingOn, title: file.basename, ref });
 		if (this.settings.showRefInTitle && !template.includes('{ref}')) {
@@ -385,11 +485,11 @@ export default class SPTaskerPlugin extends Plugin {
 
 	// -- core sync ---------------------------------------------------------------
 
-	async sendFile(file, { manual = false } = {}) {
-		if (!(file instanceof TFile) || file.extension !== 'md') return;
+	async sendFile(file: TFile, { manual = false }: { manual?: boolean } = {}) {
+		if (file.extension !== 'md') return;
 
-		const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-		const nextText = toText(fm && fm[this.settings.nextFieldName]);
+		const fm = this.frontmatterOf(file) ?? {};
+		const nextText = toText(fm[this.settings.nextFieldName]);
 		if (!nextText) {
 			if (manual) this.notify(`"${file.basename}" has no "${this.settings.nextFieldName}" value; nothing to send.`);
 			return;
@@ -406,13 +506,13 @@ export default class SPTaskerPlugin extends Plugin {
 			return;
 		}
 
-		let project = null;
+		let project: SPNamed | null = null;
 		if (projectNames.length === 1) {
 			try {
 				project = await this.client.findProject(projectNames[0]);
 			} catch (e) {
-				if (e.retryable) this.pendingRetry.add(file.path);
-				this.notify(e.message);
+				if (isRetryable(e)) this.pendingRetry.add(file.path);
+				this.notify(errMsg(e));
 				return;
 			}
 			if (!project) {
@@ -420,35 +520,36 @@ export default class SPTaskerPlugin extends Plugin {
 				return;
 			}
 		}
-		const projectName = project ? project.title || project.name : '';
+		const projectName = project ? project.title || project.name || '' : '';
 
 		const waitingRaw = fm[this.settings.waitingOnFieldName];
-		const waitingList = waitingRaw == null ? [] : Array.isArray(waitingRaw) ? waitingRaw : [waitingRaw];
+		const waitingList: unknown[] = waitingRaw == null ? [] : Array.isArray(waitingRaw) ? waitingRaw : [waitingRaw];
 		const waitingOn = joinGrammatical(waitingList);
 
-		let tagIds = [];
+		let tagIds: string[] = [];
 		let tagName = '';
 		if (waitingOn) {
-			let tag = null;
+			let tag: SPNamed | null = null;
 			try {
 				tag = await this.client.findTag(this.settings.reminderTagName);
 			} catch (e) {
-				if (e.retryable) this.pendingRetry.add(file.path);
-				this.notify(e.message);
+				if (isRetryable(e)) this.pendingRetry.add(file.path);
+				this.notify(errMsg(e));
 			}
 			if (!tag) {
 				this.notify(`Super Productivity tag "${this.settings.reminderTagName}" not found; "${file.basename}" will send untagged.`);
 			} else {
 				tagIds = [tag.id];
-				tagName = tag.title || tag.name;
+				tagName = tag.title || tag.name || '';
 			}
 		}
 
 		const dueDay = startToDueDay(fm[this.settings.startFieldName]);
 
-		const existingTaskId = fm.sp_task_id;
+		const rawTaskId = fm.sp_task_id;
+		const existingTaskId = typeof rawTaskId === 'string' || typeof rawTaskId === 'number' ? String(rawTaskId) : '';
 		const existingRef = fm.sp_task_ref;
-		const record = existingTaskId ? this.sent[existingTaskId] : null;
+		const record: SentRecord | undefined = existingTaskId ? this.sent[existingTaskId] : undefined;
 
 		// The note's own sp_task_ref, once written, is that note's permanent
 		// display number - trust it even if the sent-record cache (data.json)
@@ -456,22 +557,22 @@ export default class SPTaskerPlugin extends Plugin {
 		// then flap between the two on every subsequent edit. Only fall back
 		// to the live counter for a note that has never been assigned one.
 		const plannedRef = typeof existingRef === 'number' ? existingRef : this.refCounter;
-		let title = this.buildTitle(nextText, waitingOn, file, plannedRef);
+		const title = this.buildTitle(nextText, waitingOn, file, plannedRef);
 		// dueDay joins the signature only when present, so existing records
 		// (which never had one) keep matching and aren't needlessly re-sent.
-		let contentSig = [title, projectName, tagName].join(SEP) + (dueDay ? SEP + dueDay : '');
-		let fullSig = contentSig + SEP + file.path;
+		const contentSig = [title, projectName, tagName].join(SEP) + (dueDay ? SEP + dueDay : '');
+		const fullSig = contentSig + SEP + file.path;
 
 		try {
 			if (!manual && record && record.full === fullSig) return;
 
 			const link = this.settings.includeDeepLink ? this.buildDeepLink(file) : null;
 
-			if (record && record.content === contentSig && record.full !== fullSig) {
+			if (existingTaskId && record && record.content === contentSig && record.full !== fullSig) {
 				// Path-only change (rename/move). Refresh the link, nothing else -
 				// this must never reopen/resurrect a completed task.
 				if (link) {
-					let current = null;
+					let current: SPTask | null = null;
 					try {
 						current = await this.client.getTask(existingTaskId);
 					} catch {
@@ -489,13 +590,13 @@ export default class SPTaskerPlugin extends Plugin {
 				return;
 			}
 
-			let current = null;
+			let current: SPTask | null = null;
 			if (existingTaskId) {
 				current = await this.client.getTask(existingTaskId);
 			}
 
-			if (current && !current.isDone) {
-				const payload = { title, tagIds };
+			if (existingTaskId && current && !current.isDone) {
+				const payload: Partial<TaskPayload> = { title, tagIds };
 				if (project) payload.projectId = project.id;
 				// Updates push a strictly future start. Today is sent only if the SP
 				// task has no date yet (start added after creation); otherwise it's left
@@ -527,12 +628,12 @@ export default class SPTaskerPlugin extends Plugin {
 				await this.writeFrontmatterWithRetry(file, { sp_task_ref: newRef });
 			} catch (e) {
 				if (isNewRef) this.refCounter = newRef;
-				this.notify(`couldn't write to "${file.basename}"'s frontmatter (${e.message}); nothing was sent.`);
+				this.notify(`couldn't write to "${file.basename}"'s frontmatter (${errMsg(e)}); nothing was sent.`);
 				return;
 			}
 			await this.persist();
 
-			const createPayload = { title, tagIds };
+			const createPayload: TaskPayload = { title, tagIds };
 			if (link) createPayload.notes = link;
 			if (project) createPayload.projectId = project.id;
 			else if (this.settings.defaultProjectName) {
@@ -569,7 +670,7 @@ export default class SPTaskerPlugin extends Plugin {
 			} catch (e) {
 				await this.persist();
 				this.notify(
-					`created SP task "${title}" but couldn't record its id in "${file.basename}" (${e.message}). ` +
+					`created SP task "${title}" but couldn't record its id in "${file.basename}" (${errMsg(e)}). ` +
 						`If the next send creates a duplicate, look in Super Productivity for two tasks titled "#${newRef} ..." and remove the extra one.`
 				);
 				return;
@@ -580,16 +681,15 @@ export default class SPTaskerPlugin extends Plugin {
 			await this.flushPendingRetries(file.path);
 			if (!manual) this.notifySuccess(`created "${title}".`);
 		} catch (e) {
-			if (e.retryable) this.pendingRetry.add(file.path);
-			this.notify(e.message);
+			if (isRetryable(e)) this.pendingRetry.add(file.path);
+			this.notify(errMsg(e));
 		}
 	}
 
 	async healCounter() {
 		let max = 0;
 		for (const file of this.app.vault.getMarkdownFiles()) {
-			const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
-			const ref = fm && fm.sp_task_ref;
+			const ref = this.frontmatterOf(file)?.sp_task_ref;
 			if (typeof ref === 'number' && ref > max) max = ref;
 		}
 		const raised = Math.max(this.refCounter, max + 1);
@@ -598,33 +698,32 @@ export default class SPTaskerPlugin extends Plugin {
 			await this.persist();
 		}
 	}
-};
+}
 
 // ---------------------------------------------------------------------------
 // Settings tab
 // ---------------------------------------------------------------------------
 
-const requiredText = (label) => (value) => (value.trim() ? undefined : `${label} is required.`);
+const requiredText = (label: string) => (value: string) => (value.trim() ? undefined : `${label} is required.`);
 
 class SPTaskerSettingTab extends PluginSettingTab {
-	constructor(app, plugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+	declare plugin: SPTaskerPlugin;
 
 	// Route the declarative controls' persistence through the plugin's own
 	// data shape ({ settings, sent, refCounter }) instead of the default,
 	// which would save only `settings` and drop the task-id mappings.
-	getControlValue(key) {
-		return this.plugin.settings[key];
+	getControlValue(key: string): unknown {
+		const settings: Record<string, unknown> = this.plugin.settings;
+		return settings[key];
 	}
 
-	setControlValue(key, value) {
-		this.plugin.settings[key] = typeof value === 'string' ? value.trim() : value;
+	setControlValue(key: string, value: unknown): Promise<void> {
+		const settings: Record<string, unknown> = this.plugin.settings;
+		settings[key] = typeof value === 'string' ? value.trim() : value;
 		return this.plugin.persist();
 	}
 
-	getSettingDefinitions() {
+	getSettingDefinitions(): SettingDefinitionItem[] {
 		return [
 			{
 				name: 'How syncing works',
@@ -660,7 +759,7 @@ class SPTaskerSettingTab extends PluginSettingTab {
 										await this.plugin.client.health();
 										new Notice('SP Tasker: connected to Super Productivity.');
 									} catch (e) {
-										new Notice(`SP Tasker: ${e.message}`);
+										new Notice(`SP Tasker: ${errMsg(e)}`);
 									}
 								});
 							});

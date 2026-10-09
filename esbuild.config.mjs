@@ -6,7 +6,7 @@ const watch = process.argv.includes("--watch");
 // Deliberately unminified, with no sourcemap in release builds: directory reviewers read main.js,
 // and the developer policies prohibit obfuscation.
 const context = await esbuild.context({
-	entryPoints: ["src/main.js"],
+	entryPoints: ["src/main.ts"],
 	bundle: true,
 	format: "cjs",
 	platform: "node",

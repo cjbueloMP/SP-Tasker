@@ -38,7 +38,7 @@ You can also install it through [BRAT](https://github.com/TfTHacker/obsidian42-b
 - **Access token:** the SP access token you enter is sent as a `Bearer` token to that API URL, and is stored unencrypted in the plugin's `data.json` inside your vault (`<vault>/.obsidian/plugins/sp-tasker/`). Keep that in mind if you sync or share your vault.
 - **Account / payment:** none. Super Productivity is a separate, free app that must be installed and running on the same machine.
 - **Telemetry and ads:** none.
-- **Files:** the plugin only reads notes in your vault (frontmatter and tags) and writes `sp_task_id` / `sp_task_ref` into the frontmatter of notes it syncs. It does not access files outside your vault.
+- **Files:** the plugin only reads notes in your vault (frontmatter and tags) and writes `sp_task_id` / `sp_task_ref` into the frontmatter of notes it syncs. It does not access files outside your vault. Once at startup it also checks every note's cached frontmatter (not the note text) for the highest `sp_task_ref`, so the plugin's ref counter can never fall behind numbers already written into your notes. Nothing from that scan is stored or sent anywhere.
 - **Source and license:** open source under the [MIT license](LICENSE).
 
 ## Idempotency

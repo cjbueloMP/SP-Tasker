@@ -12,28 +12,29 @@ session: the design decisions and invariants that aren't obvious from reading th
 
 ## Architecture
 
-- Source is a single ES-module file, **`src/main.js`** (plain JS, no TypeScript, no runtime npm
-  dependencies). It uses `import ... from 'obsidian'` / `export default class`, which the
-  Community directory's lint (`no-require-imports`) requires. **esbuild** bundles it to the root
-  `main.js` (CommonJS, `obsidian` external, deliberately **unminified** and no sourcemap in release
-  builds — the developer policies prohibit obfuscation and reviewers read it). Root `main.js` is a
-  build artifact and is **gitignored**; never edit it by hand.
-- Commands: `npm run build` (one-off), `npm run dev` (watch), `npm run lint` (lints `src/` with
-  `eslint-plugin-obsidianmd`, the ruleset the directory scanner runs). `esbuild.config.mjs`,
-  `eslint.config.mjs`, `tsconfig.json` (only `allowJs`, so the type-checked rules can analyze the
-  JS) are dev tooling and are never shipped. The scanner tracks the lint plugin's latest version,
-  so `npm update` before releasing — rules change between versions. `node_modules/` is gitignored.
-  Release assets stay `main.js` + `manifest.json` only.
-- Adding a bundler was an explicit decision by the owner (who knows esbuild) to satisfy
-  `no-require-imports`. Don't go further (no TypeScript, no extra deps) without discussing.
+- Source is a single TypeScript file, **`src/main.ts`** (`strict`, no runtime npm dependencies). The
+  Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*` etc.) only on
+  `.ts`, which is why it was converted from JS in 0.3.0 (see "Known scan findings"). **esbuild**
+  bundles it to the root `main.js` (CommonJS, `obsidian` external, deliberately **unminified** and no
+  sourcemap in release builds — the developer policies prohibit obfuscation and reviewers read it).
+  Root `main.js` is a build artifact and is **gitignored**; never edit it by hand. esbuild strips
+  types without checking them, so `npm run typecheck` is what actually enforces them.
+- Commands: `npm run build` (one-off), `npm run dev` (watch), `npm run typecheck` (`tsc --noEmit`),
+  `npm run lint` (lints `src/` with `eslint-plugin-obsidianmd`, the ruleset the directory scanner
+  runs). `esbuild.config.mjs`, `eslint.config.mjs`, `tsconfig.json` are dev tooling and never
+  shipped. The scanner tracks the lint plugin's latest version, so `npm update` before releasing —
+  rules change between versions. `node_modules/` is gitignored. Release assets stay `main.js` +
+  `manifest.json` only.
+- Adding a bundler (and later TypeScript) were explicit decisions by the owner (who knows esbuild)
+  to satisfy the directory lint. Don't add runtime dependencies without discussing.
 - Licensed MIT (`LICENSE`, © 2026 Collin Buelo). The directory requires a LICENSE file.
 - `manifest.json` / `versions.json` at repo root are Obsidian's plugin metadata. Bump both together
   when releasing (see "Releasing" below).
-- No `node` binary is reliably available in this project's usual dev sandbox (the owner runs
-  lint/build via Docker or a local Node install) — there is no test suite, and often no way to run
-  the build or lint here. Verify changes by careful manual reading, and always tell the user that
-  real verification means running `npm run build` + `npm run lint` and loading the plugin in
-  Obsidian.
+- There is no test suite. `node` is not installed on the host, but the owner keeps a `node:24-slim`
+  Docker container with the repo bind-mounted at `/app`; check `docker ps` and run
+  `docker exec <name> sh -c 'cd /app && npm run typecheck && npm run lint && npm run build'`.
+  Passing those only proves it compiles and lints — behavior changes still need the plugin loaded in
+  Obsidian, so always tell the user that.
 
 ## Data model (`data.json`, at `<vault>/.obsidian/plugins/sp-tasker/data.json`)
 
@@ -43,7 +44,7 @@ during the settings-API migration; `PluginSettingTab.getControlValue`/`setContro
 overridden specifically to route through `persist()` instead of Obsidian's default, which would
 call `saveData(settings)` alone).
 
-- `settings` — see `DEFAULT_SETTINGS` in `src/main.js`. `Object.assign({}, DEFAULT_SETTINGS, loaded)`
+- `settings` — see `DEFAULT_SETTINGS` in `src/main.ts`. `{ ...DEFAULT_SETTINGS, ...loaded.settings }`
   on load backfills any newly-added key automatically; no migration script is needed for new
   settings.
 - `sent` — keyed by SP task id: `{ content, full, path }`. Two designed-in signatures joined with
@@ -196,11 +197,17 @@ fallback. Two API details that aren't obvious from a first read of `obsidian.d.t
 2. Tag the release commit with the version number **exactly**, no `v` prefix (e.g. `0.2.0`, not
    `v0.2.0`) — this is what both BRAT and Obsidian's own installer match against. (The directory
    preview scan flagged an earlier `v`-prefixed tag.)
-3. Run `npm run lint` and `npm run build`. Create the GitHub Release from that tag, and **attach the
-   freshly built `main.js` and `manifest.json` as
-   individual binary assets** — not just relying on the auto-generated source zip. This is what
-   BRAT and Obsidian's community-plugin installer actually download; they ignore the source archive
-   entirely.
+3. Push the tag. `.github/workflows/release.yml` then checks the tag equals `manifest.json`'s
+   version (fails on a `v` prefix), runs `npm ci`, lint and build, attests the artifacts, and
+   creates a **draft** GitHub Release with the freshly built `main.js` and `manifest.json` attached
+   as individual binary assets. Add release notes and publish the draft by hand. Those two assets
+   are what BRAT and Obsidian's installer actually download; they ignore the source archive
+   entirely. The release is built in CI from the tagged commit — don't attach a locally built
+   `main.js`. Requires `package-lock.json` to be committed (for `npm ci`). The workflow's own
+   `permissions:` block requests `contents: write`; Obsidian's guide also says to set repo Settings
+   → Actions → General → Workflow permissions to read and write (GitHub's docs say a workflow's
+   `permissions` key can raise access on its own, unless an org restricts it — so that setting is
+   a fallback if the release step gets a 403). Free for public repos.
 4. BRAT compatibility checklist: valid `manifest.json` at repo root (✓), a release tagged to match
    `version` with `main.js`+`manifest.json` attached (✓ once step 3 is done), repo must be public
    (or BRAT needs a PAT for a private repo). `versions.json` is *not* required by BRAT — that file
@@ -232,6 +239,29 @@ Requirements that bit or could bite this repo:
 - Lint locally with `npm run lint` (see Architecture). The scanner follows the latest
   `eslint-plugin-obsidianmd`, so a pinned old version passing is not proof the scan will pass.
 - Version bump per release is mandatory for fixes — the scanner re-scans new releases only.
+
+### Known scan findings (as of the 0.2.3 listing)
+
+The listed 0.2.3 passed review with only warnings/recommendations; none block the listing. Don't
+"fix" the accepted ones below without discussing.
+
+- **`@typescript-eslint/no-unsafe-*` warnings (~200 locations in the 0.2.3 JS).** The scanner
+  applied type-aware rules to the untyped JS (every parameter was `any`); the lint plugin's own
+  `recommended` config only applies them to `.ts`, so local lint didn't reproduce them. **Resolved
+  by the 0.3.0 TypeScript conversion** — local `npm run lint` now matches the scanner for these.
+  If they reappear after a lint-plugin update, fix the types rather than disabling the rules (the
+  preset forbids disable comments for its key rules).
+- **`ui/sentence-case` (4 warnings).** The rule lowercases "Super Productivity"/"SP Tasker" in the
+  command name and notices. Left as is — the brand names are correct, and rewording makes the UI
+  worse.
+- **"Vault Enumeration" (recommendation).** `healCounter()` calls `vault.getMarkdownFiles()` once at
+  startup to raise `refCounter` above the highest `sp_task_ref` in any note's cached frontmatter.
+  Core to the ref-integrity invariant (see Data model), so it stays. It is informational, not a
+  request to disclose; the README mentions it anyway, in "Network use and privacy".
+- **"Number of network request calls: 7" (disclosure).** All traffic goes through the single
+  `SPClient.request()` → `requestUrl` to the user-configured Super Productivity REST API; nothing
+  else leaves the machine. Already disclosed in the README's "Network use and privacy" section —
+  **keep that section accurate** if a new endpoint, host, token use, or file access is added.
 
 ## Branch/workflow notes (fluid — verify before relying on this section)
 
