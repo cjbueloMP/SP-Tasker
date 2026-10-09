@@ -12,10 +12,14 @@ session: the design decisions and invariants that aren't obvious from reading th
 
 ## Architecture
 
-- Source is TypeScript (`strict`, no runtime npm dependencies): **`src/main.ts`** (plugin class, SP
-  REST client, settings tab) and **`src/helpers.ts`** (pure functions with no Obsidian or network
-  access — date/`start` rules, title templates, `readSent`, etc. — kept separate so they can be unit
-  tested). The Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*`
+- Source is TypeScript (`strict`, no runtime npm dependencies), in `src/`: **`main.ts`** (the plugin
+  class: lifecycle, commands, scheduling, `sendFile`), **`sp-client.ts`** (`SPClient` REST client,
+  `SPApiError`, SP task/project/tag types), **`settings.ts`** (`SPSettings`, `DEFAULT_SETTINGS`,
+  `MIN_DEBOUNCE_MS`, the settings tab) and **`helpers.ts`** (pure functions with no Obsidian or
+  network access — date/`start` rules, title templates, `readSent`, etc. — so they can be unit
+  tested). `settings.ts` doesn't import `main.ts`: the tab talks to the plugin through the small
+  `SettingsHost` interface, so there is no import cycle. Only `main.ts` should know the data.json
+  shape (`PersistedData`). The Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*`
   etc.) only on `.ts`, which is why it was converted from JS in 0.3.0 (see "Scan results and known
   findings"). **esbuild** bundles it to the root `main.js` (CommonJS, `obsidian` external,
   deliberately **unminified** and no sourcemap in release builds — the developer policies prohibit
