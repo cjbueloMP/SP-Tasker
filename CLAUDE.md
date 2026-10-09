@@ -206,29 +206,46 @@ fallback. Two API details that aren't obvious from a first read of `obsidian.d.t
 
 ## Releasing
 
-1. Bump `version` in `manifest.json` and add the matching entry to `versions.json` (both keyed
-   identically, e.g. `"0.2.0": "1.13.7"`). In pre-1.0 semver, a breaking change bumps the **minor**
-   version (`0.1.x` → `0.2.0`), not just the patch.
-2. Tag the release commit with the version number **exactly**, no `v` prefix (e.g. `0.2.0`, not
-   `v0.2.0`) — this is what both BRAT and Obsidian's own installer match against. (The directory
-   preview scan flagged an earlier `v`-prefixed tag.)
-3. Push the tag. `.github/workflows/release.yml` then checks the tag equals `manifest.json`'s
-   version (fails on a `v` prefix), runs `npm ci`, lint and build, attests the artifacts, and
-   creates a **draft** GitHub Release with the freshly built `main.js` and `manifest.json` attached
-   as individual binary assets. Add release notes and publish the draft by hand. Those two assets
-   are what BRAT and Obsidian's installer actually download; they ignore the source archive
-   entirely. The release is built in CI from the tagged commit — don't attach a locally built
-   `main.js`. Requires `package-lock.json` to be committed (for `npm ci`). The workflow's own
-   `permissions:` block requests `contents: write`; Obsidian's guide also says to set repo Settings
-   → Actions → General → Workflow permissions to read and write (GitHub's docs say a workflow's
-   `permissions` key can raise access on its own, unless an org restricts it — so that setting is
-   a fallback if the release step gets a 403). Free for public repos.
+Every merge to `main` is a release. `main` is protected (see "Branch protection" below) and only
+changes through a pull request (merge-commit method, so the branch's commit hashes are preserved).
+
+1. On a feature branch, bump `version` in `manifest.json` and add the matching entry to
+   `versions.json` (both keyed identically, e.g. `"0.2.0": "1.13.7"`). In pre-1.0 semver, a breaking
+   change bumps the **minor** version (`0.1.x` → `0.2.0`), not just the patch.
+2. Open a PR into `main`. `.github/workflows/pr-checks.yml` runs typecheck, tests, lint and build,
+   plus `.github/scripts/check-release-ready.mjs`, which fails the PR unless the version is plain
+   `x.y.z`, has no existing tag or release (drafts included), is not lower than an existing release,
+   and `versions.json` maps it to `minAppVersion`.
+3. Merge the PR (merge commit). `.github/workflows/release.yml` runs on the push to `main`: if
+   `manifest.json`'s version has no tag/release yet, it reruns the checks, builds, attests, and
+   creates a **draft** GitHub Release (generated notes) with the freshly built `main.js` and
+   `manifest.json` attached as individual binary assets, targeted at the exact merge commit.
+   Review the notes and **Publish** the draft by hand — publishing creates the git tag, named
+   exactly like the version with **no `v` prefix** (what BRAT and Obsidian's installer match; the
+   directory scan flagged an earlier `v` tag). Don't tag by hand or attach a locally built
+   `main.js`: the scanner rebuilds `main.js` from the tag's commit and compares it byte-for-byte.
+   If the version already has a release the workflow does nothing, so a docs-only merge is safe.
+   The whole thing lives in one workflow on purpose: a tag created with the built-in `GITHUB_TOKEN`
+   would not trigger a second, tag-triggered workflow (GitHub suppresses that). Needs
+   `package-lock.json` committed (for `npm ci`) and `contents: write` (requested in the workflow's
+   `permissions:`); Obsidian's guide also says to set repo Settings → Actions → General → Workflow
+   permissions to read and write — GitHub's docs say the `permissions` key can raise access on its
+   own, so that setting is only a fallback if the release step gets a 403. Free for public repos.
+   *Unverified on first use:* whether a draft's tag shows up in `git tag` before it is published
+   (the existing-release check also looks at `gh release list`, which includes drafts, to be safe),
+   and `--generate-notes` / `--target <sha>` behavior in `gh release create`.
 4. BRAT compatibility checklist: valid `manifest.json` at repo root (✓), a release tagged to match
-   `version` with `main.js`+`manifest.json` attached (✓ once step 3 is done), repo must be public
+   `version` with `main.js`+`manifest.json` attached (✓ once the draft is published), repo must be public
    (or BRAT needs a PAT for a private repo). `versions.json` is *not* required by BRAT — that file
    matters for Obsidian's own Community Plugins updater, which this plugin isn't listed on.
 5. Manual install on a second machine (non-BRAT): download `main.js`/`manifest.json` from the
    release assets, place both in `<vault>/.obsidian/plugins/sp-tasker/`, enable in Obsidian.
+
+### Branch protection (GitHub ruleset on `main`, set up by the owner in repo settings)
+
+Require a pull request (approvals 0 — you can't approve your own), require the `PR checks` →
+`checks` status check, block force pushes. Don't enable "Require linear history": it forbids merge
+commits, which is the chosen merge method. Claude cannot change these settings.
 
 ## Community directory submission
 
