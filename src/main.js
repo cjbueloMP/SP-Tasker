@@ -1,6 +1,4 @@
-'use strict';
-
-const { Plugin, PluginSettingTab, Notice, TFile, requestUrl, getAllTags } = require('obsidian');
+import { Plugin, PluginSettingTab, Notice, TFile, requestUrl, getAllTags } from 'obsidian';
 
 const SEP = String.fromCharCode(1); // avoids a literal control byte in the source
 
@@ -160,7 +158,7 @@ class SPClient {
 		let json;
 		try {
 			json = res.json;
-		} catch (e) {
+		} catch {
 			json = undefined;
 		}
 
@@ -223,7 +221,7 @@ class SPClient {
 // Main plugin
 // ---------------------------------------------------------------------------
 
-module.exports = class SPTaskerPlugin extends Plugin {
+export default class SPTaskerPlugin extends Plugin {
 	async onload() {
 		const loaded = (await this.loadData()) || {};
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded.settings);
@@ -271,7 +269,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 	}
 
 	onunload() {
-		for (const timer of this._timers.values()) clearTimeout(timer);
+		for (const timer of this._timers.values()) window.clearTimeout(timer);
 		this._timers.clear();
 	}
 
@@ -316,9 +314,9 @@ module.exports = class SPTaskerPlugin extends Plugin {
 	scheduleSend(file) {
 		if (!(file instanceof TFile) || file.extension !== 'md') return;
 		const existing = this._timers.get(file.path);
-		if (existing) clearTimeout(existing);
+		if (existing) window.clearTimeout(existing);
 		const delay = Math.max(this.settings.debounceMs, MIN_DEBOUNCE_MS);
-		const timer = setTimeout(() => {
+		const timer = window.setTimeout(() => {
 			this._timers.delete(file.path);
 			this.sendFile(file, { manual: false });
 		}, delay);
@@ -371,7 +369,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 				return;
 			} catch (e) {
 				if (i === attempts - 1) throw e;
-				await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 2 ** i));
+				await new Promise((resolve) => window.setTimeout(resolve, baseDelayMs * 2 ** i));
 			}
 		}
 	}
@@ -476,7 +474,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 					let current = null;
 					try {
 						current = await this.client.getTask(existingTaskId);
-					} catch (e) {
+					} catch {
 						// best effort; fall through and still try the notes update
 					}
 					if (!current || notesAreOurs(current.notes)) {
@@ -545,7 +543,7 @@ module.exports = class SPTaskerPlugin extends Plugin {
 				try {
 					const fallback = await this.client.findProject(this.settings.defaultProjectName);
 					if (fallback) createPayload.projectId = fallback.id;
-				} catch (e) {
+				} catch {
 					// ignore; createTask below surfaces any real connectivity problem
 				}
 			}
@@ -629,7 +627,7 @@ class SPTaskerSettingTab extends PluginSettingTab {
 	getSettingDefinitions() {
 		return [
 			{
-				name: 'SP Tasker',
+				name: 'How syncing works',
 				desc: "Editing a note's frontmatter (next / waiting_on / #Project tag) creates or updates a matching task in Super Productivity. Nothing syncs back.",
 			},
 			{

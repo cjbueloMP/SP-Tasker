@@ -6,7 +6,7 @@ Obsidian plugin: editing a note's frontmatter creates or updates a matching task
 
 - `next` (frontmatter key name configurable) becomes the task title. Accepts a string, list, number, or boolean.
 - `waiting_on` (frontmatter key name configurable; string or list) prefixes the title ("Waiting on Alex: ...", or "Alex and Sam" / "Alex, Sam and Jo" for a deduped list) and adds the configured reminder tag — untagged if that tag doesn't exist yet in SP.
-- The note's `Project/<name>` tag (frontmatter or inline body), if present, picks the SP project. The prefix (`Project/` by default) is configurable and can be a comma-separated list of prefixes. Only the segment directly under the matched prefix is used, so `Project/Website` and `Project/Website/v2` collapse to the same project. Two *different* names abort the send rather than guessing. A note with no matching tag at all is created in the \
+- The note's `Project/<name>` tag (frontmatter or inline body), if present, picks the SP project. The prefix (`Project/` by default) is configurable and can be a comma-separated list of prefixes. Only the segment directly under the matched prefix is used, so `Project/Website` and `Project/Website/v2` collapse to the same project. Two *different* names abort the send rather than guessing. A note with no matching tag at all is created in the project named by the "Default project" setting (`Inbox` by default; leave it empty to let SP decide), if that project exists in SP.
 - Project and reminder tag both have to already exist in Super Productivity — the API is  read-only for both. If a note *has* a project tag but SP has no matching project, the send aborts (notice) rather than silently dropping it; a missing reminder tag just sends untagged.
 - `start` (frontmatter key name configurable; optional, `YYYY-MM-DD`) becomes the task's due date in SP. When a task is *created*, a `start` of today or later is used, and a valid `start` in the past becomes today (an overdue note starts out due now, including when a new task replaces one you completed in SP); a missing or unparseable `start` sends no due date. When an existing task is *updated*, a `start` strictly in the future is sent, and a `start` of today is sent only if the task has no date in SP yet (for example, you added `start` to the note after the task was created). This keeps a task you've pushed to a later day in SP from being snapped back to today by an unrelated edit or a manual send. A future `start` still overwrites a due date you set by hand in SP (Obsidian-first). A past or removed `start` never changes or clears an existing due date in SP.
 - Newly *created* tasks get no due date unless `start` supplies one (a past `start` counts as today). SP would otherwise stamp them as due today whenever its Today view is open; the "No due date on new tasks" setting (on by default) suppresses that. It only affects creation, never updates.
@@ -26,11 +26,20 @@ Runs automatically (debounced, 250ms floor) whenever a note's frontmatter change
 
 ## Install
 
-No build step, the plugin is pure javascript. Copy `main.js` and `manifest.json` into `<vault>/.obsidian/plugins/sp-tasker/`, then enable the plugin in Obsidian and set the API URL/token in its settings tab.
+Download `main.js` and `manifest.json` from the latest [release](../../releases) and copy them into `<vault>/.obsidian/plugins/sp-tasker/`, then enable the plugin in Obsidian and set the API URL/token in its settings tab.
 
 If updating the plugin, just drop the new main.js and manifest.json into the plugin directory, data.json stays the same and you won't have to re-enter your SP API token.
 
-I may consider adding to obsidian office community plugins, but this plugin is still pretty new (but has over a month of testing by myself), so for now it's in beta and will be available direct or through BRAT.
+You can also install it through [BRAT](https://github.com/TfTHacker/obsidian42-brat) using this repository's URL.
+
+## Network use and privacy
+
+- **Network:** the plugin's only network traffic is HTTP requests to the Super Productivity (SP) local REST API at the URL set in its settings (default `http://127.0.0.1:3876`, i.e. SP running on your own machine). It reads and writes tasks, projects and tags there. If you point the URL somewhere else, requests go to that address instead. Nothing is sent to any other server.
+- **Access token:** the SP access token you enter is sent as a `Bearer` token to that API URL, and is stored unencrypted in the plugin's `data.json` inside your vault (`<vault>/.obsidian/plugins/sp-tasker/`). Keep that in mind if you sync or share your vault.
+- **Account / payment:** none. Super Productivity is a separate, free app that must be installed and running on the same machine.
+- **Telemetry and ads:** none.
+- **Files:** the plugin only reads notes in your vault (frontmatter and tags) and writes `sp_task_id` / `sp_task_ref` into the frontmatter of notes it syncs. It does not access files outside your vault.
+- **Source and license:** open source under the [MIT license](LICENSE).
 
 ## Idempotency
 
