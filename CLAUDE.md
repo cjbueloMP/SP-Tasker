@@ -196,11 +196,17 @@ fallback. Two API details that aren't obvious from a first read of `obsidian.d.t
 2. Tag the release commit with the version number **exactly**, no `v` prefix (e.g. `0.2.0`, not
    `v0.2.0`) — this is what both BRAT and Obsidian's own installer match against. (The directory
    preview scan flagged an earlier `v`-prefixed tag.)
-3. Run `npm run lint` and `npm run build`. Create the GitHub Release from that tag, and **attach the
-   freshly built `main.js` and `manifest.json` as
-   individual binary assets** — not just relying on the auto-generated source zip. This is what
-   BRAT and Obsidian's community-plugin installer actually download; they ignore the source archive
-   entirely.
+3. Push the tag. `.github/workflows/release.yml` then checks the tag equals `manifest.json`'s
+   version (fails on a `v` prefix), runs `npm ci`, lint and build, attests the artifacts, and
+   creates a **draft** GitHub Release with the freshly built `main.js` and `manifest.json` attached
+   as individual binary assets. Add release notes and publish the draft by hand. Those two assets
+   are what BRAT and Obsidian's installer actually download; they ignore the source archive
+   entirely. The release is built in CI from the tagged commit — don't attach a locally built
+   `main.js`. Requires `package-lock.json` to be committed (for `npm ci`). The workflow's own
+   `permissions:` block requests `contents: write`; Obsidian's guide also says to set repo Settings
+   → Actions → General → Workflow permissions to read and write (GitHub's docs say a workflow's
+   `permissions` key can raise access on its own, unless an org restricts it — so that setting is
+   a fallback if the release step gets a 403). Free for public repos.
 4. BRAT compatibility checklist: valid `manifest.json` at repo root (✓), a release tagged to match
    `version` with `main.js`+`manifest.json` attached (✓ once step 3 is done), repo must be public
    (or BRAT needs a PAT for a private repo). `versions.json` is *not* required by BRAT — that file
@@ -232,6 +238,29 @@ Requirements that bit or could bite this repo:
 - Lint locally with `npm run lint` (see Architecture). The scanner follows the latest
   `eslint-plugin-obsidianmd`, so a pinned old version passing is not proof the scan will pass.
 - Version bump per release is mandatory for fixes — the scanner re-scans new releases only.
+
+### Known scan findings (accepted, as of the 0.2.3 listing)
+
+The listed 0.2.3 passed review with only warnings/recommendations. Don't "fix" these without
+discussing; none block the listing.
+
+- **`@typescript-eslint/no-unsafe-*` warnings (~200 locations).** The scanner applies type-aware
+  rules to `.js`; the lint plugin's own `recommended` config only applies them to `.ts` files, so
+  `npm run lint` does **not** reproduce them (only the dashboard scan does). Cause: untyped JS
+  params are `any`. Real fix is converting `src/main.js` to TypeScript (or JSDoc + `checkJs`) —
+  a large rewrite with no test suite, so deliberately deferred; do it as its own `0.3.0`.
+  Rules change between lint-plugin versions, so these could be promoted to errors later.
+- **`ui/sentence-case` (4 warnings).** The rule lowercases "Super Productivity"/"SP Tasker" in the
+  command name and notices. Left as is — the brand names are correct, and rewording makes the UI
+  worse.
+- **"Vault Enumeration" (recommendation).** `healCounter()` calls `vault.getMarkdownFiles()` once at
+  startup to raise `refCounter` above the highest `sp_task_ref` in any note's cached frontmatter.
+  Core to the ref-integrity invariant (see Data model), so it stays. It is informational, not a
+  request to disclose; the README mentions it anyway, in "Network use and privacy".
+- **"Number of network request calls: 7" (disclosure).** All traffic goes through the single
+  `SPClient.request()` → `requestUrl` to the user-configured Super Productivity REST API; nothing
+  else leaves the machine. Already disclosed in the README's "Network use and privacy" section —
+  **keep that section accurate** if a new endpoint, host, token use, or file access is added.
 
 ## Branch/workflow notes (fluid — verify before relying on this section)
 
