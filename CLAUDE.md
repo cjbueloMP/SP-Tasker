@@ -12,28 +12,29 @@ session: the design decisions and invariants that aren't obvious from reading th
 
 ## Architecture
 
-- Source is a single ES-module file, **`src/main.js`** (plain JS, no TypeScript, no runtime npm
-  dependencies). It uses `import ... from 'obsidian'` / `export default class`, which the
-  Community directory's lint (`no-require-imports`) requires. **esbuild** bundles it to the root
-  `main.js` (CommonJS, `obsidian` external, deliberately **unminified** and no sourcemap in release
-  builds — the developer policies prohibit obfuscation and reviewers read it). Root `main.js` is a
-  build artifact and is **gitignored**; never edit it by hand.
-- Commands: `npm run build` (one-off), `npm run dev` (watch), `npm run lint` (lints `src/` with
-  `eslint-plugin-obsidianmd`, the ruleset the directory scanner runs). `esbuild.config.mjs`,
-  `eslint.config.mjs`, `tsconfig.json` (only `allowJs`, so the type-checked rules can analyze the
-  JS) are dev tooling and are never shipped. The scanner tracks the lint plugin's latest version,
-  so `npm update` before releasing — rules change between versions. `node_modules/` is gitignored.
-  Release assets stay `main.js` + `manifest.json` only.
-- Adding a bundler was an explicit decision by the owner (who knows esbuild) to satisfy
-  `no-require-imports`. Don't go further (no TypeScript, no extra deps) without discussing.
+- Source is a single TypeScript file, **`src/main.ts`** (`strict`, no runtime npm dependencies). The
+  Community directory's lint runs *type-aware* rules (`@typescript-eslint/no-unsafe-*` etc.) only on
+  `.ts`, which is why it was converted from JS in 0.3.0 (see "Known scan findings"). **esbuild**
+  bundles it to the root `main.js` (CommonJS, `obsidian` external, deliberately **unminified** and no
+  sourcemap in release builds — the developer policies prohibit obfuscation and reviewers read it).
+  Root `main.js` is a build artifact and is **gitignored**; never edit it by hand. esbuild strips
+  types without checking them, so `npm run typecheck` is what actually enforces them.
+- Commands: `npm run build` (one-off), `npm run dev` (watch), `npm run typecheck` (`tsc --noEmit`),
+  `npm run lint` (lints `src/` with `eslint-plugin-obsidianmd`, the ruleset the directory scanner
+  runs). `esbuild.config.mjs`, `eslint.config.mjs`, `tsconfig.json` are dev tooling and never
+  shipped. The scanner tracks the lint plugin's latest version, so `npm update` before releasing —
+  rules change between versions. `node_modules/` is gitignored. Release assets stay `main.js` +
+  `manifest.json` only.
+- Adding a bundler (and later TypeScript) were explicit decisions by the owner (who knows esbuild)
+  to satisfy the directory lint. Don't add runtime dependencies without discussing.
 - Licensed MIT (`LICENSE`, © 2026 Collin Buelo). The directory requires a LICENSE file.
 - `manifest.json` / `versions.json` at repo root are Obsidian's plugin metadata. Bump both together
   when releasing (see "Releasing" below).
-- No `node` binary is reliably available in this project's usual dev sandbox (the owner runs
-  lint/build via Docker or a local Node install) — there is no test suite, and often no way to run
-  the build or lint here. Verify changes by careful manual reading, and always tell the user that
-  real verification means running `npm run build` + `npm run lint` and loading the plugin in
-  Obsidian.
+- There is no test suite. `node` is not installed on the host, but the owner keeps a `node:24-slim`
+  Docker container with the repo bind-mounted at `/app`; check `docker ps` and run
+  `docker exec <name> sh -c 'cd /app && npm run typecheck && npm run lint && npm run build'`.
+  Passing those only proves it compiles and lints — behavior changes still need the plugin loaded in
+  Obsidian, so always tell the user that.
 
 ## Data model (`data.json`, at `<vault>/.obsidian/plugins/sp-tasker/data.json`)
 
@@ -43,7 +44,7 @@ during the settings-API migration; `PluginSettingTab.getControlValue`/`setContro
 overridden specifically to route through `persist()` instead of Obsidian's default, which would
 call `saveData(settings)` alone).
 
-- `settings` — see `DEFAULT_SETTINGS` in `src/main.js`. `Object.assign({}, DEFAULT_SETTINGS, loaded)`
+- `settings` — see `DEFAULT_SETTINGS` in `src/main.ts`. `{ ...DEFAULT_SETTINGS, ...loaded.settings }`
   on load backfills any newly-added key automatically; no migration script is needed for new
   settings.
 - `sent` — keyed by SP task id: `{ content, full, path }`. Two designed-in signatures joined with
@@ -239,17 +240,17 @@ Requirements that bit or could bite this repo:
   `eslint-plugin-obsidianmd`, so a pinned old version passing is not proof the scan will pass.
 - Version bump per release is mandatory for fixes — the scanner re-scans new releases only.
 
-### Known scan findings (accepted, as of the 0.2.3 listing)
+### Known scan findings (as of the 0.2.3 listing)
 
-The listed 0.2.3 passed review with only warnings/recommendations. Don't "fix" these without
-discussing; none block the listing.
+The listed 0.2.3 passed review with only warnings/recommendations; none block the listing. Don't
+"fix" the accepted ones below without discussing.
 
-- **`@typescript-eslint/no-unsafe-*` warnings (~200 locations).** The scanner applies type-aware
-  rules to `.js`; the lint plugin's own `recommended` config only applies them to `.ts` files, so
-  `npm run lint` does **not** reproduce them (only the dashboard scan does). Cause: untyped JS
-  params are `any`. Real fix is converting `src/main.js` to TypeScript (or JSDoc + `checkJs`) —
-  a large rewrite with no test suite, so deliberately deferred; do it as its own `0.3.0`.
-  Rules change between lint-plugin versions, so these could be promoted to errors later.
+- **`@typescript-eslint/no-unsafe-*` warnings (~200 locations in the 0.2.3 JS).** The scanner
+  applied type-aware rules to the untyped JS (every parameter was `any`); the lint plugin's own
+  `recommended` config only applies them to `.ts`, so local lint didn't reproduce them. **Resolved
+  by the 0.3.0 TypeScript conversion** — local `npm run lint` now matches the scanner for these.
+  If they reappear after a lint-plugin update, fix the types rather than disabling the rules (the
+  preset forbids disable comments for its key rules).
 - **`ui/sentence-case` (4 warnings).** The rule lowercases "Super Productivity"/"SP Tasker" in the
   command name and notices. Left as is — the brand names are correct, and rewording makes the UI
   worse.

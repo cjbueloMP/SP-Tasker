@@ -1,7 +1,6 @@
 {
 	"compilerOptions": {
-		"allowJs": true,
-		"checkJs": false,
+		"strict": true,
 		"noEmit": true,
 		"module": "ESNext",
 		"moduleResolution": "bundler",
@@ -9,5 +8,5 @@
 		"lib": ["ES2022", "DOM"],
 		"skipLibCheck": true
 	},
-	"include": ["src/**/*.js"]
+	"include": ["src/**/*.ts"]
 }
