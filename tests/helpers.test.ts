@@ -6,6 +6,7 @@ import {
 	renderTemplate,
 	encodeLinkComponent,
 	parsePrefixList,
+	projectNamesFromProperty,
 	parseStartDay,
 	startToDueDay,
 	localTodayStr,
@@ -92,6 +93,36 @@ describe('parsePrefixList', () => {
 	});
 	test('empty input gives an empty list', () => {
 		assert.deepEqual(parsePrefixList(''), []);
+	});
+});
+
+describe('projectNamesFromProperty', () => {
+	test('a plain name is used as written, trimmed', () => {
+		assert.deepEqual(projectNamesFromProperty(' Website '), ['Website']);
+		assert.deepEqual(projectNamesFromProperty('Website/v2'), ['Website/v2']);
+		assert.deepEqual(projectNamesFromProperty(2026), ['2026']);
+	});
+	test('a wikilink gives the target file name, ignoring folder, alias, heading and .md', () => {
+		assert.deepEqual(projectNamesFromProperty('[[Website]]'), ['Website']);
+		assert.deepEqual(projectNamesFromProperty('[[Projects/Website|Site]]'), ['Website']);
+		assert.deepEqual(projectNamesFromProperty('[[Website#Plans]]'), ['Website']);
+		assert.deepEqual(projectNamesFromProperty('[[Website^abc123]]'), ['Website']);
+		assert.deepEqual(projectNamesFromProperty('[[Projects/Website.md]]'), ['Website']);
+	});
+	test('lists recurse, including the nested list an unquoted [[link]] parses to', () => {
+		assert.deepEqual(projectNamesFromProperty(['[[Website]]', 'Garden']), ['Website', 'Garden']);
+		assert.deepEqual(projectNamesFromProperty([['Website']]), ['Website']);
+	});
+	test('text around a link is not treated as a link', () => {
+		assert.deepEqual(projectNamesFromProperty('see [[Website]]'), ['see [[Website]]']);
+	});
+	test('missing, empty and map values give no names', () => {
+		assert.deepEqual(projectNamesFromProperty(undefined), []);
+		assert.deepEqual(projectNamesFromProperty(null), []);
+		assert.deepEqual(projectNamesFromProperty(''), []);
+		assert.deepEqual(projectNamesFromProperty([]), []);
+		assert.deepEqual(projectNamesFromProperty('[[]]'), []);
+		assert.deepEqual(projectNamesFromProperty({ a: 1 }), []);
 	});
 });
 

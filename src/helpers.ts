@@ -58,6 +58,21 @@ export function parsePrefixList(raw: string): string[] {
 		.map((s) => (s.endsWith('/') ? s : `${s}/`));
 }
 
+// Project names from a note's project property: a plain name, a wikilink or a
+// list of either. "[[Folder/Website#Plans|Site]]" -> "Website" (the link
+// target's file name, not the alias). Lists recurse, which also covers an
+// unquoted `Projects: [[Website]]`, since YAML parses that as a nested list.
+// Text with anything around a link is used as written. Maps are ignored.
+export function projectNamesFromProperty(value: unknown): string[] {
+	if (Array.isArray(value)) return (value as unknown[]).flatMap(projectNamesFromProperty);
+	if (value !== null && typeof value === 'object') return [];
+	const text = toText(value);
+	const link = /^\[\[([^\]|#^]*)[^\]]*\]\]$/.exec(text);
+	if (!link) return text ? [text] : [];
+	const name = link[1].trim().split('/').pop()?.replace(/\.md$/i, '').trim() ?? '';
+	return name ? [name] : [];
+}
+
 // A note's start value (YYYY-MM-DD, optionally followed by a time) as a real
 // calendar date, or null if it's missing or unparseable. Not time-sensitive.
 export function parseStartDay(value: unknown): { day: string; parsed: Date } | null {
