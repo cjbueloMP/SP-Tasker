@@ -13,6 +13,7 @@ export type SPSettings = {
 	titleTemplate: string;
 	waitingTitleTemplate: string;
 	showRefInTitle: boolean;
+	projectFieldName: string;
 	projectTagPrefixes: string;
 	nextFieldName: string;
 	waitingOnFieldName: string;
@@ -31,6 +32,7 @@ export const DEFAULT_SETTINGS: SPSettings = {
 	titleTemplate: '{next}',
 	waitingTitleTemplate: 'Waiting on {waiting_on}: {next}',
 	showRefInTitle: true,
+	projectFieldName: '',
 	projectTagPrefixes: 'Project/',
 	nextFieldName: 'next',
 	waitingOnFieldName: 'waiting_on',
@@ -74,7 +76,7 @@ export class SPTaskerSettingTab extends PluginSettingTab {
 		return [
 			{
 				name: 'How syncing works',
-				desc: "Editing a note's frontmatter (next / waiting_on / #Project tag) creates or updates a matching task in Super Productivity. Nothing syncs back.",
+				desc: "Editing a note's frontmatter (next / waiting_on / project) creates or updates a matching task in Super Productivity. Nothing syncs back.",
 			},
 			{
 				type: 'group',
@@ -175,19 +177,28 @@ export class SPTaskerSettingTab extends PluginSettingTab {
 						},
 					},
 					{
+						name: 'Project property name',
+						desc: 'Frontmatter key naming the SP project, as a name or a link to a note (the linked file name is used). Leave empty to ignore properties. Works together with project tags; two different projects on one note skip the send.',
+						control: {
+							type: 'text',
+							key: 'projectFieldName',
+							placeholder: 'Projects',
+							defaultValue: DEFAULT_SETTINGS.projectFieldName,
+						},
+					},
+					{
 						name: 'Project tag prefixes',
-						desc: 'Comma-separated tag prefixes that mark a project, e.g. "Project/, Area/". Only the segment right after the prefix is used.',
+						desc: 'Comma-separated tag prefixes that mark a project, e.g. "Project/, Area/". Only the segment right after the prefix is used. Leave empty to ignore tags.',
 						control: {
 							type: 'text',
 							key: 'projectTagPrefixes',
 							placeholder: DEFAULT_SETTINGS.projectTagPrefixes,
 							defaultValue: DEFAULT_SETTINGS.projectTagPrefixes,
-							validate: requiredText('Project tag prefixes'),
 						},
 					},
 					{
 						name: 'Default project',
-						desc: 'SP project used for new tasks from notes with no project tag, so they do not land in whichever project view is open in SP. Must already exist in SP. Leave empty to let SP decide. Only affects task creation.',
+						desc: 'SP project used for new tasks from notes with no project, so they do not land in whichever project view is open in SP. Must already exist in SP. Leave empty to let SP decide. Only affects task creation.',
 						control: {
 							type: 'text',
 							key: 'defaultProjectName',

@@ -7,6 +7,7 @@ import {
 	renderTemplate,
 	encodeLinkComponent,
 	parsePrefixList,
+	projectNamesFromProperty,
 	parseStartDay,
 	startToDueDay,
 	localTodayStr,
@@ -152,11 +153,20 @@ export default class SPTaskerPlugin extends Plugin {
 		return this.app.metadataCache.getFileCache(file)?.frontmatter;
 	}
 
+	// Names from the project property and from project tags go into one set, so
+	// a note mid-migration (same name in both) resolves cleanly and two
+	// different names are reported as ambiguous. Either source is off when its
+	// setting is empty.
 	resolveProjectNames(file: TFile): string[] {
+		const names = new Set<string>();
+		const field = this.settings.projectFieldName;
+		if (field) {
+			for (const name of projectNamesFromProperty(this.frontmatterOf(file)?.[field])) names.add(name);
+		}
+		const prefixes = parsePrefixList(this.settings.projectTagPrefixes);
+		if (prefixes.length === 0) return [...names];
 		const cache = this.app.metadataCache.getFileCache(file);
 		const tags = (cache && getAllTags(cache)) || [];
-		const prefixes = parsePrefixList(this.settings.projectTagPrefixes);
-		const names = new Set<string>();
 		for (const t of tags) {
 			const clean = t.replace(/^#/, '');
 			for (const prefix of prefixes) {
@@ -229,7 +239,7 @@ export default class SPTaskerPlugin extends Plugin {
 
 		const projectNames = this.resolveProjectNames(file);
 		if (projectNames.length > 1) {
-			this.notify(`"${file.basename}" has ambiguous project tags (${projectNames.join(', ')}); skipped.`);
+			this.notify(`"${file.basename}" has more than one project (${projectNames.join(', ')}); skipped.`);
 			return;
 		}
 
@@ -366,7 +376,7 @@ export default class SPTaskerPlugin extends Plugin {
 			else if (this.settings.defaultProjectName) {
 				// SP files a new task under whichever project view is open unless
 				// the payload names a project (projectId can't be null). Pin notes
-				// with no Project/ tag to a fixed default instead. Best effort: a
+				// with no project to a fixed default instead. Best effort: a
 				// failed or missing lookup just falls back to SP's own behaviour.
 				try {
 					const fallback = await this.client.findProject(this.settings.defaultProjectName);

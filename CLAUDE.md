@@ -97,8 +97,8 @@ convenient recovery step:
 - Never auto-delete an orphaned SP task (e.g. one created but never linked back due to a
   frontmatter write failure) — recovery is left to the user, deliberately, even though the plugin
   could technically clean it up.
-- Ambiguous input (two different `Project/` tags on one note) aborts with a notice rather than
-  guessing which one to use.
+- Ambiguous input (two different project names on one note, from tags and/or the project
+  property) aborts with a notice rather than guessing which one to use.
 - Project/tag lookups are read-only against SP by design — SP's REST API has no create endpoint
   for either, and the plugin doesn't try to work around that.
 
@@ -139,10 +139,31 @@ convenient recovery step:
 
 - `tagIds` is sent on every update (`[]` when the note has no `waiting_on`), so tags added by hand
   in SP are cleared on the next sync. Intended: Obsidian is the source of truth for tags.
-- `projectId` is sent on update only when the note has a `Project/` tag (Obsidian wins). With no
+- `projectId` is sent on update only when the note names a project (Obsidian wins). With no
   tag, an update leaves SP's project alone, so a manual move in SP sticks while the task is alive.
   A task *recreated* (old one done/deleted) gets the note's project, else `defaultProjectName` —
   never the old task's project, because the owner wants projects edited in Obsidian.
+
+## Project sources (property and/or tags, 0.4.0)
+
+`resolveProjectNames()` merges two sources into one set: the frontmatter property named by
+`projectFieldName` (parsed by `projectNamesFromProperty()` in `helpers.ts`) and the tag prefixes in
+`projectTagPrefixes`. An empty setting turns that source off. One distinct name → that project;
+two or more → the "ambiguous" abort. The owner moved their vault from `#Project/X` tags to a
+`Projects: "[[X]]"` link property; the tag source was kept (rather than replaced) so unconverted
+notes don't silently lose their project, especially on the create/recreate path, where they would
+otherwise fall to `defaultProjectName`.
+
+- Defaults are chosen so an upgrade changes nothing for other installs (~22 directory downloads):
+  `projectFieldName` defaults to **empty** (a user with an unrelated `Projects` property would
+  otherwise start hitting "project not found" aborts), and `projectTagPrefixes` keeps `Project/`.
+  The owner sets the property name and clears the prefixes in their own settings.
+- Property values: a plain name is used exactly as written (no `/` splitting, unlike tags). A
+  wikilink resolves to the target's **file name**, not the alias (`[[A/Website#h|Site]]` →
+  `Website`). Lists recurse, which also covers an unquoted `Projects: [[Website]]` (YAML parses it
+  as a nested list). Matching the key is case-sensitive, like the other field-name settings.
+- `contentSig` stores the *resolved SP project name*, not its source, so moving a note from tag to
+  property (same name) leaves its `sent` record valid. No re-PATCH, no migration.
 
 ## Default project (`defaultProjectName`, default `Inbox`)
 
@@ -150,7 +171,7 @@ convenient recovery step:
 view is open in SP lands in that project even if the note names none. `additional` spreads last, so
 an explicit `projectId` wins — but `WritableTaskFields.projectId` is `string`, **not** nullable, so
 `projectId: null` (the `dueDay: null` trick) would fail validation. Instead, on create only, a note
-with no `Project/` tag gets the project named by `defaultProjectName`, resolved with the same
+with no project gets the project named by `defaultProjectName`, resolved with the same
 read-only `findProject` lookup. Lookup failure/miss is non-fatal (falls back to SP's behaviour);
 empty setting disables it. Update never touches `projectId` unless the note names a project, and
 the project isn't part of `contentSig` for this fallback, so existing `sent` records stay valid.
@@ -224,28 +245,42 @@ changes through a pull request (merge-commit method, so the branch's commit hash
    exactly like the version with **no `v` prefix** (what BRAT and Obsidian's installer match; the
    directory scan flagged an earlier `v` tag). Don't tag by hand or attach a locally built
    `main.js`: the scanner rebuilds `main.js` from the tag's commit and compares it byte-for-byte.
-   If the version already has a release the workflow does nothing, so a docs-only merge is safe.
+   If the version already has a release the workflow does nothing, but that case can't arise from
+   a normal PR: the required PR check fails any PR without a version bump, **docs-only ones
+   included** (kept strict on purpose, so a code change can't merge and silently release nothing).
+   Docs-only changes ride along with the next release, or take a patch bump if urgent.
    The whole thing lives in one workflow on purpose: a tag created with the built-in `GITHUB_TOKEN`
    would not trigger a second, tag-triggered workflow (GitHub suppresses that). Needs
    `package-lock.json` committed (for `npm ci`) and `contents: write` (requested in the workflow's
    `permissions:`); Obsidian's guide also says to set repo Settings → Actions → General → Workflow
    permissions to read and write — GitHub's docs say the `permissions` key can raise access on its
    own, so that setting is only a fallback if the release step gets a 403. Free for public repos.
-   *Unverified on first use:* whether a draft's tag shows up in `git tag` before it is published
-   (the existing-release check also looks at `gh release list`, which includes drafts, to be safe),
-   and `--generate-notes` / `--target <sha>` behavior in `gh release create`.
-4. BRAT compatibility checklist: valid `manifest.json` at repo root (✓), a release tagged to match
+   This flow has been exercised end to end (PR checks, merge, auto-drafted release with generated
+   notes, publish) and worked as designed; the draft-detection and `--generate-notes` /
+   `--target <sha>` details that were unverified beforehand held up.
+4. **Publish the draft promptly after merging.** The directory's installer needs both the committed
+   `manifest.json` version *and* a published release tagged with it. Between the merge and the
+   publish, `main` already names the new version but only a draft exists, so installs/updates
+   could fail in that gap.
+5. **No manual step for the Community directory.** Each published release is scanned automatically
+   (results in minutes, installable within ~24h if it passes; a failing release is dropped from
+   in-app search within 24h). Optionally check the developer dashboard afterwards for failure
+   details. Don't re-submit the plugin for a new version.
+6. BRAT compatibility checklist: valid `manifest.json` at repo root (✓), a release tagged to match
    `version` with `main.js`+`manifest.json` attached (✓ once the draft is published), repo must be public
    (or BRAT needs a PAT for a private repo). `versions.json` is *not* required by BRAT — that file
    matters for Obsidian's own Community Plugins updater, which this plugin isn't listed on.
-5. Manual install on a second machine (non-BRAT): download `main.js`/`manifest.json` from the
+7. Manual install on a second machine (non-BRAT): download `main.js`/`manifest.json` from the
    release assets, place both in `<vault>/.obsidian/plugins/sp-tasker/`, enable in Obsidian.
 
 ### Branch protection (GitHub ruleset on `main`, set up by the owner in repo settings)
 
-Require a pull request (approvals 0 — you can't approve your own), require the `PR checks` →
-`checks` status check, block force pushes. Don't enable "Require linear history": it forbids merge
-commits, which is the chosen merge method. Claude cannot change these settings.
+The ruleset lives only in GitHub (Settings → Rules); there is no copy in the repo. It targets the
+default branch and: restricts deletion, blocks force pushes, requires a PR (0 approvals — you can't
+approve your own; merge method restricted to "merge" so branch hashes are preserved), and requires
+the `checks` status check (the job in `pr-checks.yml`; the job has no `name:`, so its check name is
+the job id). Bypass list is empty on purpose. Don't enable "Require linear history": it forbids merge
+commits. Claude cannot change these settings.
 
 ## Community directory submission
 
